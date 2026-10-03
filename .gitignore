@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*
+!data/trajectories/
+data/trajectories/*
+!data/trajectories/.gitkeep
+oracle_failures.log
+.env
+.diskcache/
