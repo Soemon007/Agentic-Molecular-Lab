@@ -1,6 +1,17 @@
-rdkit==2023.9.6
-PyTDC==1.1.15
-numpy==1.26.4
-pandas==2.3.3
-diskcache==5.6.3
+# Python 3.13 (Omnigent needs >=3.12). Install order matters:
+#   pip install -r requirements.txt && pip install --no-deps PyTDC==1.1.15
+rdkit>=2025.9
+numpy>=2.0,<2.4
+pandas
+scikit-learn
+scipy
+networkx
+fuzzywuzzy
+huggingface_hub
+tqdm
+requests
+setuptools<81
+diskcache
 pytest>=8
+anthropic
+omnigent==0.16.0

@@ -17,6 +17,7 @@ import time
 import warnings
 from pathlib import Path
 
+import compat  # noqa: F401  (must precede any tdc import)
 import domain
 import chem_core
 
@@ -24,6 +25,7 @@ REPO = Path(__file__).resolve().parent
 DEFAULT_TRAJ = REPO / "data" / "trajectories" / "trajectory.csv"
 DEFAULT_FAIL_LOG = REPO / "oracle_failures.log"
 FAILURE_ALARM = 0.02
+SELFTEST_SMILES = "O=C(CCCN1CCC(O)(CC1)c1ccc(Cl)cc1)c1ccc(F)cc1"
 FIELDS = ["call_n", "smiles", "score", "origin_branch", "sa", "ad_similarity", "alerts"]
 
 
@@ -42,6 +44,13 @@ def ensure_tdc_assets() -> None:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 tdc_oracle_mod.drd2_model = tdc_oracle_mod.load_drd2_model()
+        # Install self-test (NOT an optimisation query, never logged): TDC swallows internal
+        # errors into 0.0, which would silently zero every score. Haloperidol must be ~1.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            probe = tdc_oracle_mod.drd2(SELFTEST_SMILES)
+        if probe < 0.9:
+            raise RuntimeError(f"DRD2 oracle self-test failed (haloperidol={probe}); check numpy<2.4 / sklearn versions")
     finally:
         os.chdir(cwd)
 

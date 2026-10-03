@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from oracle import DRD2Oracle  # noqa: E402
+from oracle import DRD2Oracle  # noqa: E402  (also applies the tdc compat shim)
 
 
 def main(n=10_000, seed=0, out=None):

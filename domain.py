@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+import compat  # noqa: F401
+
 REPO = Path(__file__).resolve().parent
 DATA = REPO / "data"
 ORACLE_PKL = DATA / "oracle" / "drd2_current.pkl"
