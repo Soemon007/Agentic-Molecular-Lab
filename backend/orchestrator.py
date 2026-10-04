@@ -51,6 +51,7 @@ class LabSession:
     coordinator: object = None
     trigger_log: list = field(default_factory=list)
     adversary_calls: int = 0
+    round: int = 0
 
     @property
     def oracle_calls_used(self) -> int:
@@ -99,7 +100,7 @@ async def oracle_step(sess: LabSession, gate, cand: Candidate) -> bool:
     """The ONLY path to a score. Policies (budget cap, approval gate) vet it first."""
     mol = chem_core.mol_from_smiles(cand.smiles)
     verdict = await gate.check("tool_call", {
-        "tool": "oracle_evaluate", "agent": "oracle",
+        "tool": "oracle_evaluate", "agent": "oracle", "branch": cand.origin_branch,
         "arguments": {"smiles": cand.smiles, "alerts": chem_core.get_alerts(mol)}})
     if not verdict.allowed:
         return False
@@ -192,7 +193,8 @@ async def adversary_step(sess, gate, executor, rnd):
 
 
 async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_path=None, verbose=True,
-                  noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None, seed_mode="known"):
+                  noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None, seed_mode="known",
+                  approver=None, should_stop=None):
     from oracle import DRD2Oracle
     random.seed(seed)
     run_id = run_id or f"{'adv' if adversary else 'noadv'}_{branches}_{seed_mode}_seed{seed}"
@@ -201,24 +203,35 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
     sess = LabSession(oracle=oracle, budget=budget)
     sess.adversary_enabled = adversary
     sess.chatlog = ChatLog(run_id)
-    gate = build_gate(oracle, budget)
+    gate = build_gate(oracle, budget, approver=approver)
     sess.gate = gate
+
+    def _policy_event(rec):  # DENY / ASK records, attributed to this run's chat log
+        extra = {k: v for k, v in rec.items() if k not in ("event", "t")}
+        sess.chatlog.event("policy", round=sess.round, verdict=rec["event"], **extra)
+    gate.on_event = _policy_event
     executor = make_executor(llm or llm_mode(), seed)
     if hasattr(executor, "noise"):
         executor.noise, executor.exploit = noise, exploit
     seed_beam(oracle, sess.beam, sess.gatekeeper, seed_mode, seed)
     sess.history.append({**telemetry.snapshot(sess.beam), "round": 0})  # history[r] == round r
+    sess.chatlog.event("round", **sess.history[0], oracle_calls_used=oracle.calls,
+                       best=round(sess.beam.top(1)[0].score, 4))
     sess.state = SessionState.RUNNING
     sess.coordinator = Coordinator([BRANCHES[b] for b in branches], default=quota)
     rnd, stalled = 0, 0
     while oracle.calls < budget and rnd < max_rounds:  # hard stop at the ceiling
+        if should_stop and should_stop():  # cooperative stop from the UI
+            break
         rnd += 1
+        sess.round = rnd
         before = oracle.calls
         quotas, instr = sess.coordinator.quotas(), sess.coordinator.instructions()
         rec = await run_round(sess, gate, executor, rnd, quotas, instr)
         sess.coordinator.end_round()  # decrement cooldowns BEFORE a fresh flag
         trig = await adversary_step(sess, gate, executor, rnd)
         rec["quotas"], rec["trigger"] = quotas, trig["fired"]
+        sess.chatlog.event("round", **rec)
         if verbose:
             print(f"round {rnd:3d} calls={rec['oracle_calls_used']:4d} top10={rec['top10_mean']:.3f} "
                   f"best={rec['best']:.3f} scaffolds={rec['scaffolds_in_beam']} quotas={list(quotas.values())}"

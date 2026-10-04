@@ -1,0 +1,78 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Design tokens from the design file. Light is the default; `.dark` on <html> swaps them. */
+:root {
+  --bg: #f3f0ea; --surface: #ffffff; --ink: #14130f; --mute: #6f6a62; --line: #ddd8ce; --soft: #eae6de;
+  --navbg: rgba(243, 240, 234, 0.88); --sec: #e4dfd5;
+  --ok: #2f7d52; --okbg: rgba(47, 125, 82, 0.1);
+  --ask: #a9690a; --askbg: rgba(201, 138, 27, 0.1);
+  --deny: #b63d32; --denybg: rgba(182, 61, 50, 0.09);
+}
+.dark {
+  --bg: #0f0e0c; --surface: #181714; --ink: #f5f2ec; --mute: #a09a8f; --line: #2b2925; --soft: #201e1b;
+  --navbg: rgba(15, 14, 12, 0.82); --sec: #26241f;
+  --ok: #6dbf8b; --okbg: rgba(109, 191, 139, 0.14);
+  --ask: #e0a94a; --askbg: rgba(224, 169, 74, 0.12);
+  --deny: #e27b6f; --denybg: rgba(226, 123, 111, 0.14);
+}
+
+@theme inline {
+  --color-canvas: var(--bg);
+  --color-surface: var(--surface);
+  --color-soft: var(--soft);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-mute: var(--mute);
+  --color-sec: var(--sec);
+  --color-allow: var(--ok);
+  --color-allowbg: var(--okbg);
+  --color-ask: var(--ask);
+  --color-askbg: var(--askbg);
+  --color-deny: var(--deny);
+  --color-denybg: var(--denybg);
+  --color-lilac: #f0d7ff;
+  --font-sans: 'Hanken Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  --radius-sm: 12px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-xl: 40px;
+}
+
+html { color-scheme: light; }
+html.dark { color-scheme: dark; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: 'Hanken Grotesk', system-ui, sans-serif; -webkit-font-smoothing: antialiased;
+  transition: background 0.4s, color 0.4s;
+}
+a:hover { color: var(--mute); }
+::selection { background: #d9d3c7; color: #14130f; }
+input[type='range'] { accent-color: var(--ink); width: 100%; }
+button { font-family: inherit; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+@keyframes pulse-ring { 0% { box-shadow: 0 0 0 0 rgba(120, 112, 98, 0.45); } 70% { box-shadow: 0 0 0 11px rgba(120, 112, 98, 0); } 100% { box-shadow: 0 0 0 0 rgba(120, 112, 98, 0); } }
+@keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+@keyframes rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.anim-rise { animation: rise 0.8s both; }
+.anim-pulse { animation: pulse-ring 2s infinite; }
+.anim-blink { animation: blink 2.4s infinite; }
+.skeleton { background: linear-gradient(90deg, var(--soft) 25%, var(--line) 50%, var(--soft) 75%); background-size: 200% 100%; animation: shimmer 1.6s infinite; }
+
+/* shared button recipes */
+.btn { display: inline-flex; align-items: center; justify-content: center; white-space: nowrap; border-radius: 999px; font-weight: 600; cursor: pointer; transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.25s, background 0.2s; }
+.btn:hover:not(:disabled) { transform: translateY(-2px); }
+.btn:active:not(:disabled) { transform: scale(0.95); }
+.btn-primary { background: #f0d7ff; color: #14130f; border: 1px solid #14130f; }
+.btn-primary:hover:not(:disabled) { box-shadow: 0 12px 24px -12px rgba(0, 0, 0, 0.55); }
+.btn-ghost { background: transparent; color: var(--ink); border: 1px solid var(--ink); }
+.btn-ghost:hover:not(:disabled) { background: var(--soft); }
+.btn-ink { background: var(--ink); color: var(--bg); border: 1px solid var(--ink); }
+.btn-ink:hover:not(:disabled) { box-shadow: 0 8px 18px -8px rgba(0, 0, 0, 0.5); }
+.card { min-width: 0; overflow-wrap: anywhere; background: var(--surface); border: 1px solid var(--line); border-radius: 32px; padding: 28px; }
+.mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.num { font-variant-numeric: tabular-nums; }

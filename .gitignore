@@ -9,3 +9,5 @@ backend/data/trajectories/*
 oracle_failures.log
 .env
 .diskcache/
+frontend/node_modules/
+frontend/dist/

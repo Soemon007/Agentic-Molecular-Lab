@@ -22,11 +22,13 @@ backend/
   policies.py       Omnigent FunctionPolicy objects + PolicyGate
   llm.py            Omnigent Executors: AnthropicExecutor (Haiku/Sonnet), OfflineExecutor (mock)
   chatlog.py        agent chat / proposal-outcome logging
+  server.py         FastAPI: reads the lab's files for the UI, starts/stops runs, relays approvals
   orchestrator.py   session, main loop, adversary step
   agents/           scout, branch_a/b/c, adversary, coordinator (+ offline mock)
   baselines/        random_stub.py, single_call_llm.py
   eval/             pmo_auc.py, ablation.py, run_seeds.py, render_results.py
-  tests/            28 tests
+  tests/            33 tests
+frontend/           React + Vite + Tailwind UI (see "Frontend")
 ```
 Everything runs from the repo root; data lands in `backend/data/` (gitignored except the folder skeleton).
 
@@ -43,6 +45,28 @@ AUTOPILOT=true .venv/bin/python backend/eval/run_seeds.py [known|cold]          
 ```
 Set `ANTHROPIC_API_KEY` (or `LLM_MODE=anthropic`) to use real Haiku/Sonnet; without it the mock is used.
 `AUTOPILOT=true` logs approval-gate events and auto-rejects; leave it unset for the interactive `input()` demo.
+
+## Frontend
+React + TypeScript + Tailwind, implementing the Claude Design file `Agentic Molecular Lab.dc.html` (tokens, type, light/dark).
+Every screen reads real data; nothing is placeholder.
+```bash
+cd frontend && npm install && npm run build     # once; the API server then serves frontend/dist
+.venv/bin/python backend/server.py              # http://127.0.0.1:8000
+# hot reload: keep the server running, then `npm run dev` in frontend/ (http://localhost:5173, /api is proxied)
+```
+| page | what it shows | source |
+|---|---|---|
+| Home | hero, one real rejected and one real scored proposal, headline AUC numbers with their caveats | latest run, `results_*.json` |
+| Setup | budget, branches, adversary, mock/live LLM, known/cold seeds, electrophile approval (ask me / auto-reject) | `POST /api/runs` → `run_lab` in a worker thread |
+| Run | live oracle-call meter, beam (RDKit depictions), best-score and AD/SA charts, agent feed, policy gate with human approve/deny, Gatekeeper rejection mix, adversary trigger banner, Stop | trajectory CSV + chat log |
+| Inspector | every agent call: prompt, input, tool output, tokens, latency, verdict, and the outcome of each proposal | chat log |
+| Results | per-seed AUC-10 by method and budget checkpoint, with the offline-mock caveats; CSV export | `results_known.json` / `results_cold.json` |
+
+Deliberately **not** built, because the backend has no such thing: pause/resume (there is Stop), dollar cost (no pricing in
+the repo; tokens are shown, and are 0 for the mock), a fixed "round N of 20" (rounds run until the budget is spent),
+"surrogate best" and "exploit rate" columns (the lab does not measure them), a design-system page, and the design's
+invented policies (checkpoint overwrite) and sample data. The AD/SA-per-round chart and electrophile decisions only exist
+for runs started after the `round` / `policy` chat-log events were added; older runs say so instead of faking it.
 
 ## Results (offline mock; budget 1,000; seeds 0–2; mean and variance across seeds)
 Metric: PMO top-10 AUC (trapezoid over the top-10 mean sampled every 10 calls, normalised by the budget at each

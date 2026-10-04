@@ -15,3 +15,6 @@ diskcache
 pytest>=8
 anthropic
 omnigent==0.16.0
+fastapi
+uvicorn
+httpx  # test client for backend/tests/test_server.py

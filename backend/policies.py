@@ -74,16 +74,21 @@ class Verdict:
 class PolicyGate:
     """Evaluates policies in declaration order: DENY short-circuits, ASK goes to the approver."""
 
-    def __init__(self, policies: list[FunctionPolicy], log_path=None, autopilot=None):
+    def __init__(self, policies: list[FunctionPolicy], log_path=None, autopilot=None, approver=None):
         self.policies = policies
+        self.approver = approver  # optional `async (reason, content) -> bool` (the UI); replaces input()/autopilot
+        self.on_event = None  # optional `(record) -> None`, called for every DENY / ASK record
         self.log_path = Path(log_path) if log_path else Path(__file__).resolve().parent / "data" / "policy_events.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.autopilot = AUTOPILOT if autopilot is None else autopilot
         self.counts = {"ALLOW": 0, "DENY": 0, "ASK": 0, "ASK_APPROVED": 0, "ASK_REJECTED": 0}
 
     def _log(self, **kw):
+        rec = {"t": time.strftime("%FT%T"), **kw}
         with self.log_path.open("a") as f:
-            f.write(json.dumps({"t": time.strftime("%FT%T"), **kw}, default=str) + "\n")
+            f.write(json.dumps(rec, default=str) + "\n")
+        if self.on_event:
+            self.on_event(rec)
 
     async def check(self, phase: str, content: dict) -> Verdict:
         ask_reason = None
@@ -98,10 +103,14 @@ class PolicyGate:
                 ask_reason = r.reason
         if ask_reason:
             self.counts["ASK"] += 1
-            approved = self._approve(ask_reason, content)
+            if self.approver:
+                approved = bool(await self.approver(ask_reason, content))
+            else:
+                approved = self._approve(ask_reason, content)
             self.counts["ASK_APPROVED" if approved else "ASK_REJECTED"] += 1
-            self._log(event="ASK", approved=approved, autopilot=self.autopilot, reason=ask_reason,
-                      smiles=content.get("arguments", {}).get("smiles"))
+            self._log(event="ASK", approved=approved, autopilot=self.autopilot and not self.approver,
+                      reason=ask_reason, smiles=content.get("arguments", {}).get("smiles"),
+                      branch=content.get("branch"))
             return Verdict(approved, "ASK", ask_reason)
         self.counts["ALLOW"] += 1
         return Verdict(True, "ALLOW")
@@ -113,9 +122,9 @@ class PolicyGate:
         return input(f"\n[APPROVAL] {reason}\n  molecule: {smi}\n  send to oracle? [y/N] ").strip().lower() == "y"
 
 
-def build_gate(oracle, ceiling: int, log_path=None, autopilot=None) -> PolicyGate:
+def build_gate(oracle, ceiling: int, log_path=None, autopilot=None, approver=None) -> PolicyGate:
     return PolicyGate([
         FunctionPolicy(name="write_permission", on=["tool_call"], callable=write_permission),
         FunctionPolicy(name="budget_cap", on=["tool_call"], callable=make_budget_cap(oracle, ceiling)),
         FunctionPolicy(name="electrophile_approval", on=["tool_call"], callable=electrophile_approval),
-    ], log_path=log_path, autopilot=autopilot)
+    ], log_path=log_path, autopilot=autopilot, approver=approver)
