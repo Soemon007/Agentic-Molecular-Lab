@@ -129,3 +129,13 @@ def test_cold_seeds_are_counted_valid_and_not_the_known_drugs(tmp_path):
     assert o.calls == 5 and len(beam) >= 1 and o.failures == 0
     assert not set(c.smiles for c in beam) & set(chem_core.SEEDS.values())
     o._fh.close()
+
+
+def test_oracle_does_not_depend_on_the_working_directory(tmp_path, monkeypatch):
+    """TDC resolves its cache relative to the CWD and re-downloads 35 MB when it is missing; the wrapper must not."""
+    from oracle import DRD2Oracle
+    monkeypatch.chdir(tmp_path)
+    o = DRD2Oracle(traj_path=tmp_path / "t.csv", report_at_exit=False)
+    assert o("O=C(CCCN1CCC(O)(CC1)c1ccc(Cl)cc1)c1ccc(F)cc1") > 0.9  # haloperidol
+    assert not (tmp_path / "oracle").exists(), "the oracle weights were downloaded into the CWD"
+    o.close()

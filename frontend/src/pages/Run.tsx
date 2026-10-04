@@ -69,7 +69,7 @@ function RunView({ id }: { id: string }) {
 
       <div className="mx-auto flex max-w-[1240px] flex-col gap-11 px-4 pb-30 pt-9 sm:px-8">
         {s.status === 'error' && <Banner tone="deny" title="This run failed." body={s.error ?? 'Unknown error'} />}
-        {s.summary?.stalled && <Banner tone="ask" title="The run stalled." body="The Gatekeeper and policies rejected every proposal for five rounds in a row, so the run stopped early instead of spinning." />}
+        {s.summary?.stalled && s.status !== 'error' && <Banner tone="ask" title="The run stalled." body={`For five rounds in a row no proposal reached the oracle (${s.summary.stall_reason ?? 'the Gatekeeper and policies rejected every proposal'}), so the run stopped early instead of spinning.`} />}
         {s.policy.pending.filter(a => a.status === 'pending').map(a => <ApprovalBanner key={a.id} a={a} onDecide={async ok => { await api.decide(id, a.id, ok); refresh() }} />)}
         {alert && alertKey !== dismissed && <AdversaryBanner t={alert} adversaryOn={s.cfg.adversary !== false} onDismiss={() => setDismissed(alertKey)} inspect={() => nav(`/inspector/${id}?agent=adversary&round=${alert.round}`)} />}
 
@@ -246,7 +246,8 @@ function Policy({ s }: { s: RunState }) {
     { name: 'budget-cap', agent: 'oracle step', text: `Hard stop at the ceiling: ${fmt(s.used)} of ${fmt(s.budget)} calls spent.`, tone: s.used >= s.budget ? 'deny' : 'ok', label: s.used >= s.budget ? 'REACHED' : 'OPEN' },
     { name: 'electrophile-approval', agent: 'oracle step', text: p.recorded ? (s.cfg.ask_human ? `${p.ask} electrophile${p.ask === 1 ? '' : 's'} asked a human, ${p.ask_approved} approved.` : `${p.ask} electrophile${p.ask === 1 ? '' : 's'} auto-rejected (autopilot, no human asked).`) : `${p.oracle_rejected} proposals were stopped at the oracle step (older run: reasons not recorded).`, tone: askN ? 'ask' : 'ok', label: askN ? `ASK ×${askN}` : 'CLEAR' },
   ]
-  const rej = Object.entries(s.gatekeeper).filter(([k]) => k !== 'policy_rejected').sort((a, b) => b[1] - a[1])
+  const rej = Object.entries(s.gatekeeper).filter(([k]) => k !== 'policy_rejected' && k !== 'not_selected').sort((a, b) => b[1] - a[1])
+  const notSelected = s.gatekeeper.not_selected ?? 0  // valid proposals the surrogate ranked below the quota; not a rejection
   const maxRej = Math.max(1, ...rej.map(r => r[1]))
   return (
     <div className="flex flex-col gap-5">
@@ -278,6 +279,7 @@ function Policy({ s }: { s: RunState }) {
       <div className="card">
         <div className="text-lg font-bold">Gatekeeper rejections</div>
         <div className="mb-4 mt-[3px] text-sm text-mute">Proposals stopped on chemistry before they could cost a call.</div>
+        {notSelected > 0 && <div className="mb-3 text-sm text-mute">{fmt(notSelected)} further proposals were valid but ranked below the quota by the surrogate, so they were not scored (and can be proposed again).</div>}
         {rej.length === 0 ? <div className="text-sm text-mute">None yet.</div> : (
           <div className="flex flex-col gap-2.5">
             {rej.map(([k, v]) => (

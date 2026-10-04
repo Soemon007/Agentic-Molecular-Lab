@@ -11,22 +11,28 @@ const stdev = (xs: number[]) => { const m = mean(xs); return xs.length > 1 ? Mat
 
 function rowsFor(r: ResultsFile, cp: string): Row[] {
   const rand = Object.values(r.random ?? {}).map(x => x[cp]).filter(v => v != null)
+  const one = r.single_call?.[cp]  // a one-shot of 50 molecules is only comparable at @50
+  const single: Row = one != null
+    ? { name: 'Single-call LLM', adv: 'n/a', mean: one, sd: 0, values: [one], bar: '#6F6A62' }
+    : { name: 'Single-call LLM', adv: 'n/a', values: [], bar: 'var(--sec)', note: r.single_call ? 'One shot of 50 molecules: @50 only' : 'Not run' }
   return [
     { name: 'Random (ZINC)', adv: 'n/a', mean: rand.length ? mean(rand) : undefined, sd: rand.length ? stdev(rand) : undefined, values: rand, bar: '#C4BEB1' },
-    { name: 'Single-call LLM', adv: 'n/a', values: [], bar: 'var(--sec)', note: 'Not run (no API key)' },
-    { name: 'Multi-agent', adv: 'Off', mean: r.ablated[cp]?.mean, sd: r.ablated[cp] && sd(r.ablated[cp].var), values: r.ablated[cp]?.values ?? [], bar: '#A39D91' },
-    { name: 'Multi-agent', adv: 'On', mean: r.ours[cp]?.mean, sd: r.ours[cp] && sd(r.ours[cp].var), values: r.ours[cp]?.values ?? [], bar: '#2F7D52', triggers: r.trigger_rounds.join(' · ') },
+    single,
+    { name: 'Multi-agent', adv: 'Off', mean: r.ablated[cp]?.mean, sd: r.ablated[cp] && sd(r.ablated[cp].var), values: r.ablated[cp]?.values ?? [], bar: '#A39D91', note: 'Not run' },
+    ...(Object.keys(r.ours).length ? [{ name: 'Multi-agent', adv: 'On', mean: r.ours[cp]?.mean, sd: r.ours[cp] && sd(r.ours[cp].var), values: r.ours[cp]?.values ?? [], bar: '#2F7D52', triggers: r.trigger_rounds.join(' · ') }] : []),
   ]
 }
 
 export default function Results() {
   const { data, error } = usePoll(api.results, null, [])
-  const [start, setStart] = useState<'known' | 'cold'>('known')
+  const [start, setStart] = useState<'known' | 'cold' | 'live'>('live')
   const [cp, setCp] = useState('1000')
-  const avail = (['known', 'cold'] as const).filter(k => data?.[k])
+  const avail = (['known', 'cold', 'live'] as const).filter(k => data?.[k])
   const mode = data?.[start] ? start : avail[0]
   const r = mode ? data?.[mode] : undefined
-  const rows = useMemo(() => (r ? rowsFor(r, cp) : []), [r, cp])
+  const hasCp = (c: string) => !!(r?.ours[c] || r?.ablated[c])
+  const cpSel = r && !hasCp(cp) ? [...CPS].reverse().find(hasCp) ?? cp : cp  // a set with a smaller budget opens on its largest checkpoint
+  const rows = useMemo(() => (r ? rowsFor(r, cpSel) : []), [r, cpSel])
 
   const exportCsv = () => {
     if (!data) return
@@ -35,8 +41,10 @@ export default function Results() {
     downloadCsv('results.csv', out)
   }
 
+  const live = r?.llm_mode === 'anthropic'
   const identical = r ? CPS.every(c => r.ours[c] && r.ablated[c] && Math.abs(r.ours[c].mean - r.ablated[c].mean) < 1e-9) : false
   const fired = r ? r.trigger_rounds.filter(t => t > 0).length : 0
+  const acted = r?.acted_rounds ? r.acted_rounds.filter(t => t > 0).length : 0
 
   return (
     <div>
@@ -49,18 +57,21 @@ export default function Results() {
           : !r ? <Empty title="No results yet." body={<>Run <code className="mono">.venv/bin/python backend/eval/run_seeds.py</code> to write <code className="mono">backend/data/results_*.json</code>.</>} />
           : <>
             <div className="mb-5 rounded-[28px] border border-ask bg-askbg px-6 py-4 text-[15px] leading-normal">
-              <b>Read this first.</b> {r.llm_mode === 'offline' ? 'These runs used the offline mock (RDKit edits plus a rate of rule-violating proposals), not Haiku or Sonnet. They validate plumbing and evaluation, not LLM behaviour.' : `LLM mode: ${r.llm_mode}.`}
+              <b>Read this first.</b> {live
+                ? `These runs used live Claude (Haiku for the Scout and the three branches, Sonnet for the adversary), starting from 5 random ZINC molecules. ${r.seeds.length} seeds is a small sample: read the spread before the means.`
+                : 'These runs used the offline mock (RDKit edits plus a rate of rule-violating proposals), not Haiku or Sonnet. They validate plumbing and evaluation, not LLM behaviour.'}
               {mode === 'known' && ' The warm start begins with known DRD2 drugs the oracle already scores near 1.0, so every number here is flattered. Switch to Cold for the fair view.'}
+              {r.notes?.map((n, i) => <span key={i} className="mt-2 block">{n}</span>)}
             </div>
 
             <div className="mb-5 flex flex-wrap items-center gap-x-8 gap-y-3">
-              <Toggle label="Seed molecules" value={mode!} onChange={v => setStart(v as 'known')} options={[['known', 'Known ligands', !data.known], ['cold', 'Cold (ZINC)', !data.cold]]} />
-              <Toggle label="Budget checkpoint" value={cp} onChange={setCp} options={CPS.map(c => [c, `@${Number(c).toLocaleString()}`, !r.ours[c]] as [string, string, boolean])} />
+              <Toggle label="Run set" value={mode!} onChange={v => setStart(v as 'known')} options={[['known', 'Warm · mock', !data.known], ['cold', 'Cold · mock', !data.cold], ['live', 'Cold · live Claude', !data.live]]} />
+              <Toggle label="Budget checkpoint" value={cpSel} onChange={setCp} options={CPS.map(c => [c, `@${Number(c).toLocaleString()}`, !hasCp(c)] as [string, string, boolean])} />
             </div>
 
             <Reveal>
               <div className="card">
-                <div className="mb-5 text-lg font-bold">Oracle AUC top-10 <span className="text-sm font-normal text-mute">· bar = mean, dots = seeds · @{Number(cp).toLocaleString()} calls</span></div>
+                <div className="mb-5 text-lg font-bold">Oracle AUC top-10 <span className="text-sm font-normal text-mute">· bar = mean, dots = seeds · @{Number(cpSel).toLocaleString()} calls</span></div>
                 <div className="flex flex-col gap-5">
                   {rows.map((x, i) => (
                     <div key={i} className="grid items-center gap-4 [grid-template-columns:minmax(110px,210px)_1fr_64px]">
@@ -100,11 +111,15 @@ export default function Results() {
             </Reveal>
 
             <div className="mx-auto mt-8 max-w-[760px] text-[15px] leading-relaxed text-mute">
-              <p className="m-0 mb-3"><b className="text-ink">The ablation is a null result{identical ? ', by construction' : ''}.</b>{' '}
-                {identical
-                  ? `With and without the adversary the runs are identical at every checkpoint, because the deterministic trigger fired in ${fired} of ${r.seeds.length} seeds. The mock never reward-hacks, so the adversary was never called.`
-                  : `The trigger fired in ${fired} of ${r.seeds.length} seeds.`}{' '}
-                Nothing here shows that catching shortcuts helps; that needs a run where score climbs while AD similarity falls.</p>
+              <p className="m-0 mb-3"><b className="text-ink">{live ? 'What the adversary did.' : `The ablation is a null result${identical ? ', by construction' : ''}.`}</b>{' '}
+                {live
+                  ? (Object.keys(r.ours).length
+                    ? `The deterministic trigger fired in ${fired} of ${r.seeds.length} runs with the adversary on, and the coordinator acted on it in ${acted}. Two arms differing by live-LLM noise are not evidence that the adversary helps or hurts; that needs a run where score climbs while AD similarity falls.`
+                    : `The deterministic trigger fired in ${fired} of ${r.seeds.length} runs, but the adversary was not operating in them, so nothing acted on it. Whether the adversary helps or hurts is untested live; that needs a run where score climbs while AD similarity falls.`)
+                  : <>{identical
+                    ? `With and without the adversary the runs are identical at every checkpoint, because the deterministic trigger fired in ${fired} of ${r.seeds.length} seeds. The mock never reward-hacks, so the adversary was never called.`
+                    : `The trigger fired in ${fired} of ${r.seeds.length} seeds.`}{' '}
+                    Nothing here shows that catching shortcuts helps; that needs a run where score climbs while AD similarity falls.</>}</p>
               {mode === 'cold' && <p className="m-0 mb-3"><b className="text-ink">Cold start shows the mock is not an optimiser.</b> Its AUC sits near random’s, so this table says nothing for or against the LLM branches.</p>}
               <p className="m-0"><b className="text-ink">One oracle.</b> Everything is DRD2, a single SVM classifier. A classifier score is not binding affinity.</p>
             </div>

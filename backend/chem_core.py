@@ -144,14 +144,16 @@ class Gatekeeper:
         self.rejections: dict[str, Counter] = defaultdict(Counter)
         self.accepted: Counter = Counter()
         self.seen: set[str] = set()  # canonical SMILES already sent to (or queued for) the oracle
+        self.dup_hits: Counter = Counter()  # canonical SMILES -> times it was proposed again after being scored
 
     def register_seen(self, smiles: str) -> None:
         c = canonical(smiles)
         if c:
             self.seen.add(c)
 
-    def check(self, smiles: str, branch: str, parent_smiles: str | None = None):
-        """Return (mol_or_None, reason_or_None). On accept the canonical SMILES is marked seen."""
+    def check(self, smiles: str, branch: str, parent_smiles: str | None = None, commit: bool = True):
+        """Return (mol_or_None, reason_or_None). On accept the canonical SMILES is marked seen, unless commit=False
+        (the ranked path validates every proposal first and commits only the ones it spends the quota on)."""
         mol = mol_from_smiles(smiles)
         if mol is None:
             return self._reject(branch, "invalid_smiles")
@@ -161,6 +163,7 @@ class Gatekeeper:
             return self._reject(branch, "logp")
         can = Chem.MolToSmiles(mol)
         if can in self.seen:
+            self.dup_hits[can] += 1
             return self._reject(branch, "duplicate")
 
         if branch in ("branch_a", "branch_b"):
@@ -175,9 +178,27 @@ class Gatekeeper:
             elif not is_valid_branch_b(mol, parent):
                 return self._reject(branch, "scaffold_unchanged")
 
+        if commit:
+            self.seen.add(can)
+            self.accepted[branch] += 1
+        return mol, None
+
+    def hot_duplicates(self, k: int) -> list[str]:
+        """The k molecules agents keep re-proposing. Measured on two live runs: 30 molecules were half of all
+        duplicate proposals and 100 were 84%, so a short list covers most of them."""
+        return [smi for smi, _ in self.dup_hits.most_common(k)]
+
+    def commit(self, mol, branch: str) -> bool:
+        """Mark a molecule that passed check(commit=False) as seen. False (counted as a duplicate) if something
+        else, e.g. another branch this round, committed it first."""
+        can = Chem.MolToSmiles(mol)
+        if can in self.seen:
+            self.dup_hits[can] += 1
+            self._reject(branch, "duplicate")
+            return False
         self.seen.add(can)
         self.accepted[branch] += 1
-        return mol, None
+        return True
 
     def _reject(self, branch, reason):
         self.rejections[branch][reason] += 1

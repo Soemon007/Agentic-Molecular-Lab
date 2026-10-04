@@ -17,7 +17,8 @@ const AGENTS: Record<string, AgentMeta> = {
 export const agentMeta = (k: string): AgentMeta => AGENTS[k] ?? { key: k, name: k, ini: k.slice(0, 1).toUpperCase(), bg: 'var(--soft)', fg: 'var(--ink)' }
 export const AGENT_KEYS = ['scout', 'branch_a', 'branch_b', 'branch_c', 'coordinator', 'adversary']
 
-export const humanReason = (r: string) => r.replace(/_/g, ' ')
+const REASONS: Record<string, string> = { not_selected: 'valid, ranked below the quota', policy_rejected: 'stopped by a policy' }
+export const humanReason = (r: string) => REASONS[r] ?? r.replace(/_/g, ' ')
 
 export const TRIGGER_TEXT: Record<string, string> = {
   low_scaffold_diversity: 'fewer than 3 distinct scaffolds in the top 10',

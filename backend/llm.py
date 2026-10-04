@@ -56,19 +56,34 @@ class AnthropicExecutor(Executor):
             import anthropic
             client = anthropic.AsyncAnthropic()
         self.client = client
+        self.no_forced_tool: set[str] = set()  # models that reject tool_choice type "tool" (claude-sonnet-5-5 does)
+
+    async def _create(self, config: ExecutorConfig, system_prompt: str, user: str, spec: dict, force: bool):
+        # No `temperature`: anthropic >= 1.11 removed sampling parameters from messages.create(), so passing it
+        # raised TypeError on every call. `config.temperature` is therefore a no-op here (the adversary's 0.0 too).
+        kw = dict(model=config.model, max_tokens=min(config.max_tokens, 4096), system=system_prompt,
+                  messages=[{"role": "user", "content": user}],
+                  tools=[{"name": spec["name"], "description": spec.get("description", ""),
+                          "input_schema": spec["input_schema"]}])
+        if force:
+            kw["tool_choice"] = {"type": "tool", "name": spec["name"]}
+        else:  # model cannot be forced: default tool_choice, so say it in the prompt instead
+            kw["system"] = f"{system_prompt}\n\nRespond only by calling the `{spec['name']}` tool."
+        return await self.client.messages.create(**kw)
 
     async def run_turn(self, messages, tools, system_prompt, config: ExecutorConfig | None = None) -> AsyncIterator:
         config = config or ExecutorConfig()
         user = "\n\n".join(m.content for m in messages if m.role == "user" and isinstance(m.content, str))
-        spec = tools[0]  # our agents expose exactly one tool; force it
+        spec = tools[0]  # our agents expose exactly one tool; force it where the model allows
         try:
-            resp = await self.client.messages.create(
-                model=config.model, max_tokens=min(config.max_tokens, 4096),
-                temperature=config.temperature, system=system_prompt,
-                messages=[{"role": "user", "content": user}],
-                tools=[{"name": spec["name"], "description": spec.get("description", ""),
-                        "input_schema": spec["input_schema"]}],
-                tool_choice={"type": "tool", "name": spec["name"]})
+            force = config.model not in self.no_forced_tool
+            try:
+                resp = await self._create(config, system_prompt, user, spec, force)
+            except Exception as e:
+                if not (force and "tool_choice" in str(e)):
+                    raise
+                self.no_forced_tool.add(config.model)  # remember, so only the first call to this model pays a retry
+                resp = await self._create(config, system_prompt, user, spec, False)
         except Exception as e:  # surfaced to the runner, which treats it as an empty turn
             yield ExecutorError(message=f"{type(e).__name__}: {e}")
             return

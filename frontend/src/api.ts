@@ -20,7 +20,7 @@ export interface Approval { id: string; status: 'pending' | 'approved' | 'reject
 export interface PolicyEvent { round: number; verdict: 'ASK' | 'DENY'; policy?: string; agent?: string; tool?: string; reason: string; approved?: boolean; smiles?: string; branch?: string; ts?: string }
 
 export interface RunState {
-  id: string; status: RunStatus; error: string | null; summary: { stalled?: boolean; trigger_rounds?: number } | null
+  id: string; status: RunStatus; error: string | null; summary: { stalled?: boolean; stall_reason?: string | null; trigger_rounds?: number } | null
   cfg: { budget?: number; branches?: string; adversary?: boolean; seed_mode?: string; llm?: string; seed?: number; ask_human?: boolean }
   used: number; budget: number; round: number; llm: string | null
   tokens: { input: number; output: number; total: number }
@@ -43,10 +43,12 @@ export interface AucCell { mean: number; var: number; values: number[] }
 export interface ResultsFile {
   budget: number; seeds: number[]; llm_mode: string; exploit_mock: boolean; seed_mode: string
   ours: Record<string, AucCell>; ablated: Record<string, AucCell>
-  trigger_rounds: number[]; adversary_calls: number[]; tokens: { input_tokens: number; output_tokens: number }[]
+  trigger_rounds: number[]; adversary_calls: number[]; tokens: ({ input_tokens: number; output_tokens: number } | number | null)[]
   random: Record<string, Record<string, number>>
+  // live sets only (eval/live_results.py)
+  acted_rounds?: number[]; single_call?: Record<string, number>; notes?: string[]
 }
-export type Results = Partial<Record<'known' | 'cold', ResultsFile>>
+export type Results = Partial<Record<'known' | 'cold' | 'live', ResultsFile>>
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const r = await fetch(url, init)

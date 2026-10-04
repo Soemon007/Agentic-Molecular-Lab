@@ -358,7 +358,10 @@ def _worker(h: Handle):
             adversary=cfg["adversary"], seed_mode=cfg["seed_mode"], run_id=h.id, approver=approver,
             should_stop=lambda: h.stop))
         h.summary = summarize(sess)
-        h.status = "stopped" if h.stop else "finished"
+        if sess.stalled and sess.stall_is_error:  # agent calls failed (e.g. a rejected API request): that is a failure, not "budget spent"
+            h.status, h.error = "error", f"Stopped after {sess.oracle.calls} oracle calls: {sess.stall_reason}."
+        else:
+            h.status = "stopped" if h.stop else "finished"
     except Exception as e:  # surfaced in the UI rather than dying silently
         h.status, h.error = "error", f"{type(e).__name__}: {e}"
     _save_meta(h)
@@ -432,7 +435,7 @@ def call_detail(run_id: str, call_id: str):
 @app.get("/api/results")
 def results():
     out = {}
-    for tag, key in (("main", "known"), ("cold", "cold")):
+    for tag, key in (("main", "known"), ("cold", "cold"), ("cold_live", "live")):
         f = DATA / f"results_{tag}.json"
         if f.exists():
             out[key] = json.loads(f.read_text())

@@ -30,6 +30,7 @@ from llm import TokenLedger, llm_mode, make_executor
 from chatlog import ChatLog
 from domain import DATA
 from policies import build_gate
+from surrogate import Surrogate
 
 BRANCHES = {"a": "branch_a", "b": "branch_b", "c": "branch_c"}
 
@@ -48,6 +49,13 @@ class LabSession:
     chatlog: object = None
     adversary_enabled: bool = True
     stalled: bool = False
+    stall_reason: str | None = None
+    stall_is_error: bool = False  # True when agent calls themselves failed (API error, policy deny), not just rejected proposals
+    round_agent_error: str | None = None  # first agent failure seen in the current round
+    labels: list = field(default_factory=list)  # (smiles, oracle score) of everything scored so far: the surrogate's data
+    recent: list = field(default_factory=list)  # per round, the oracle's verdicts on that round's scored proposals
+    last_rejects: dict = field(default_factory=dict)  # branch -> its own fixable rejections from last round
+    surrogate: Surrogate = field(default_factory=Surrogate)
     coordinator: object = None
     trigger_log: list = field(default_factory=list)
     adversary_calls: int = 0
@@ -90,10 +98,21 @@ def seed_beam(oracle, beam: ScaffoldBeam | None = None, gatekeeper: Gatekeeper |
 
 
 def beam_payload(beam, n, extra=None, limit=20):
-    rows = [{"id": c.id, "smiles": c.smiles, "score": round(c.score, 3), "scaffold": c.core_scaffold,
-             "mw": round(Descriptors.MolWt(chem_core.mol_from_smiles(c.smiles)), 1)}  # lets agents respect the MW cap
-            for c in sorted(beam.members, key=lambda c: -c.score)[:limit]]
-    return {"beam": rows, "n": n, **(extra or {})}
+    def row(c):
+        mol = chem_core.mol_from_smiles(c.smiles)
+        return {"id": c.id, "smiles": c.smiles, "score": round(c.score, 3), "scaffold": c.core_scaffold,
+                "mw": round(Descriptors.MolWt(mol), 1),  # lets agents respect the MW cap ...
+                "logp": round(Descriptors.MolLogP(mol), 1)}  # ... and the logP cap
+    return {"beam": [row(c) for c in sorted(beam.members, key=lambda c: -c.score)[:limit]], "n": n, **(extra or {})}
+
+
+RECENT_ROUNDS, RECENT_MAX, REJECT_MAX, HOT_MAX = 2, 16, 4, 20
+FIXABLE = {"invalid_smiles", "logp", "mw", "ring_count_change", "scaffold_change", "scaffold_unchanged"}
+
+
+def recent_results(sess) -> list:
+    """The oracle's verdicts on the last RECENT_ROUNDS rounds of proposals, newest first."""
+    return [r for rnd in reversed(sess.recent[-RECENT_ROUNDS:]) for r in rnd][:RECENT_MAX]
 
 
 async def oracle_step(sess: LabSession, gate, cand: Candidate) -> bool:
@@ -105,6 +124,7 @@ async def oracle_step(sess: LabSession, gate, cand: Candidate) -> bool:
     if not verdict.allowed:
         return False
     sess.oracle.score_candidate(cand)
+    sess.labels.append((cand.smiles, cand.score))
     return True
 
 
@@ -117,58 +137,96 @@ def _log_outcome(sess, out, **kw):
 async def run_round(sess: LabSession, gate, executor, rnd: int, quotas: dict[str, int], instructions=None,
                     oversample: int = 3) -> dict:
     instructions = instructions or {}
-    brief = await run_agent(REGISTRY["scout"], executor, beam_payload(sess.beam, 1), gate, sess.ledger,
+    sess.round_agent_error = None
+    memory = {"recent_results": recent_results(sess)}
+    # the do-not-repeat list skips molecules the payload already shows (beam, recent results): no need to say it twice
+    shown = {c.smiles for c in sess.beam.members} | {r[0] for r in memory["recent_results"]}
+    hot = [m for m in sess.gatekeeper.hot_duplicates(HOT_MAX + len(shown)) if m not in shown][:HOT_MAX]
+    brief = await run_agent(REGISTRY["scout"], executor, beam_payload(sess.beam, 1, memory), gate, sess.ledger,
                             chatlog=sess.chatlog, rnd=rnd)
     brief_text = brief.args.get("brief", "")
+    if brief.error or brief.denied:
+        sess.round_agent_error = f"scout: {brief.error or brief.denied}"
 
     async def branch(name, quota):
         extra = {"brief": brief_text, "feedback_last_round": sess.last_rejections.get(name, {}),
-                 "instruction": instructions.get(name, "")}
+                 "instruction": instructions.get(name, ""), **memory, "do_not_repeat": hot,
+                 "your_recent_rejections": sess.last_rejects.get(name, [])}
         r = await run_agent(REGISTRY[name], executor, beam_payload(sess.beam, quota * oversample, extra),
                             gate, sess.ledger, chatlog=sess.chatlog, rnd=rnd)
         return name, r
 
     results = await asyncio.gather(*(branch(n, q) for n, q in quotas.items() if q > 0))
     by_id = {c.id: c for c in sess.beam.members}
-    scored = []
+    sess.surrogate.fit(sess.labels)  # once per round: fitted on the oracle results so far, never on proposals
+    scored, verdicts = [], []
     for name, r in results:
         if r.denied or r.error:
             sess.last_rejections[name] = {"policy_denied_or_error": 1}
+            sess.round_agent_error = sess.round_agent_error or f"{name}: {r.error or r.denied}"
             continue
-        taken, before = 0, dict(sess.gatekeeper.rejections.get(name, {}))
-        for p in r.args.get("proposals", []):
-            if taken >= quotas[name] or sess.oracle.calls >= sess.budget:
-                break
-            parent = by_id.get(p.get("parent_id"))
-            out = {"call_id": r.call_id, "round": rnd, "agent": name, "parent_id": p.get("parent_id"),
-                   "smiles": p.get("smiles"), "agent_generated": True}
-            if parent is None:
-                sess.gatekeeper._reject(name, "unknown_parent")
-                _log_outcome(sess, out, gate_reason="unknown_parent")
-                continue
-            mol, reason = sess.gatekeeper.check(p.get("smiles", ""), name, parent.smiles)
-            if mol is None:
-                _log_outcome(sess, out, gate_reason=reason)
-                continue
-            cand = Candidate(smiles=chem_core.Chem.MolToSmiles(mol), origin_branch=name, parent_id=parent.id,
-                             generation=rnd)
-            if await oracle_step(sess, gate, cand):
-                sess.beam.add(cand)
-                sess.all_candidates.append(cand)
-                scored.append(cand)
-                taken += 1
-                _log_outcome(sess, out, oracle_score=round(cand.score, 4), ad_similarity=cand.ad_similarity,
-                             sa_score=cand.sa_score, alerts=cand.alerts, scaffold=cand.core_scaffold)
-            else:
-                _log_outcome(sess, out, gate_reason="policy_rejected")
+        before = dict(sess.gatekeeper.rejections.get(name, {}))
+        await _score_ranked(sess, gate, name, r, quotas[name], by_id, rnd, scored, verdicts)
         after = sess.gatekeeper.rejections.get(name, {})
         sess.last_rejections[name] = {k: v - before.get(k, 0) for k, v in after.items() if v - before.get(k, 0)}
+    sess.recent.append(verdicts)
     top = sess.beam.top(10)
     rec = {**telemetry.snapshot(sess.beam), "round": rnd, "oracle_calls_used": sess.oracle_calls_used, "scored": len(scored),
            "top10_mean": round(sum(c.score for c in top) / len(top), 4), "best": round(top[0].score, 4),
            "scaffolds_in_beam": len(sess.beam.scaffold_counts())}
     sess.history.append(rec)
     return rec
+
+
+def _outcome(r, rnd, name, p):
+    return {"call_id": r.call_id, "round": rnd, "agent": name, "parent_id": p.get("parent_id"),
+            "smiles": p.get("smiles"), "agent_generated": True}
+
+
+async def _score_ranked(sess, gate, name, r, quota, by_id, rnd, scored, verdicts):
+    """Validate every proposal first, rank the valid ones with the surrogate, spend the quota on the best.
+    Valid proposals that are not selected are logged as `not_selected` and are NOT marked seen, so they can be
+    proposed again later."""
+    valid, fixable = [], []
+    for p in r.args.get("proposals", []):
+        out = _outcome(r, rnd, name, p)
+        parent = by_id.get(p.get("parent_id"))
+        if parent is None:
+            sess.gatekeeper._reject(name, "unknown_parent")
+            _log_outcome(sess, out, gate_reason="unknown_parent")
+            continue
+        mol, reason = sess.gatekeeper.check(p.get("smiles", ""), name, parent.smiles, commit=False)
+        if mol is None:
+            _log_outcome(sess, out, gate_reason=reason)
+            if reason in FIXABLE and len(fixable) < REJECT_MAX:
+                fixable.append([p.get("smiles"), reason.replace("_", " ")])
+            continue
+        valid.append((p, parent, mol, out))
+    preds = sess.surrogate.predict([chem_core.Chem.MolToSmiles(v[2]) for v in valid])
+    order = sess.surrogate.rank([chem_core.Chem.MolToSmiles(v[2]) for v in valid])
+    taken = 0
+    for k, i in enumerate(order):
+        p, parent, mol, out = valid[i]
+        pred = {"surrogate_rank": k + 1, "surrogate_mean": round(preds[i][0], 3) if preds[i] else None}
+        if taken >= quota or sess.oracle.calls >= sess.budget:
+            _log_outcome(sess, out, gate_reason="not_selected", **pred)
+            continue
+        if not sess.gatekeeper.commit(mol, name):  # another branch got the same molecule this round
+            _log_outcome(sess, out, gate_reason="duplicate", **pred)
+            continue
+        cand = Candidate(smiles=chem_core.Chem.MolToSmiles(mol), origin_branch=name, parent_id=parent.id,
+                         generation=rnd)
+        if await oracle_step(sess, gate, cand):
+            sess.beam.add(cand)
+            sess.all_candidates.append(cand)
+            scored.append(cand)
+            taken += 1
+            verdicts.append([cand.smiles, round(cand.score, 3), round(cand.score - parent.score, 3)])  # smiles, score, delta
+            _log_outcome(sess, out, oracle_score=round(cand.score, 4), ad_similarity=cand.ad_similarity,
+                         sa_score=cand.sa_score, alerts=cand.alerts, scaffold=cand.core_scaffold, **pred)
+        else:
+            _log_outcome(sess, out, gate_reason="policy_rejected", **pred)
+    sess.last_rejects[name] = fixable
 
 
 async def adversary_step(sess, gate, executor, rnd):
@@ -214,6 +272,7 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
     if hasattr(executor, "noise"):
         executor.noise, executor.exploit = noise, exploit
     seed_beam(oracle, sess.beam, sess.gatekeeper, seed_mode, seed)
+    sess.labels = [(c.smiles, c.score) for c in sess.beam.members]  # the seeds are the surrogate's first labels
     sess.history.append({**telemetry.snapshot(sess.beam), "round": 0})  # history[r] == round r
     sess.chatlog.event("round", **sess.history[0], oracle_calls_used=oracle.calls,
                        best=round(sess.beam.top(1)[0].score, 4))
@@ -239,6 +298,9 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
         stalled = stalled + 1 if oracle.calls == before else 0
         if stalled >= 5:  # gatekeeper/policies rejecting everything: stop rather than spin
             sess.stalled = True  # surfaced in the summary; never a silent truncation
+            sess.stall_is_error = sess.round_agent_error is not None
+            sess.stall_reason = (f"agent calls are failing ({sess.round_agent_error})" if sess.stall_is_error
+                                 else "the Gatekeeper and policies rejected every proposal")
             break
     sess.state = SessionState.COMPLETED
     oracle.report()
@@ -251,7 +313,8 @@ def summarize(sess: LabSession) -> dict:
            "rejections": sess.gatekeeper.rejection_report(), "accepted": dict(sess.gatekeeper.accepted),
            "policy_counts": sess.gate.counts, "tokens": sess.ledger.as_dict(),
            "trigger_rounds": sum(1 for t in sess.trigger_log if t["fired"]),
-           "adversary_calls": sess.adversary_calls, "stalled": sess.stalled, "rounds": len(sess.history) - 1}
+           "adversary_calls": sess.adversary_calls, "stalled": sess.stalled, "stall_reason": sess.stall_reason,
+           "rounds": len(sess.history) - 1}
     by_branch = {}
     for c in sess.all_candidates:
         by_branch.setdefault(c.origin_branch, set()).add(c.core_scaffold)

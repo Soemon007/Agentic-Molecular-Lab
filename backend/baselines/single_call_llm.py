@@ -30,7 +30,7 @@ def run(client=None, out=None, model=HAIKU):
     if client is None:
         import anthropic
         client = anthropic.Anthropic()
-    resp = client.messages.create(model=model, max_tokens=4096, temperature=0.7,
+    resp = client.messages.create(model=model, max_tokens=4096,  # no temperature: removed in anthropic >= 1.11
                                   messages=[{"role": "user", "content": PROMPT}])
     text = "".join(b.text for b in resp.content if b.type == "text")
     tokens = {"input_tokens": resp.usage.input_tokens, "output_tokens": resp.usage.output_tokens}

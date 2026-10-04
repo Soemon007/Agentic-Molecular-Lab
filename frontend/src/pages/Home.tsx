@@ -20,35 +20,39 @@ function useCountUp() {
   return k
 }
 
-/** A real rejected proposal and a real scored one, from the newest run that has both. */
+/** A real rejected proposal and a real scored one, from the best-suited run that has both (live Claude first). */
 function useShowcase() {
   const { data: runs } = usePoll(api.runs, null, [])
   const [s, setS] = useState<{ run: string; bad: Outcome; good: Outcome } | null>(null)
+  const [preferred, setPreferred] = useState<string | null>(null)
   const done = useRef(false)
   useEffect(() => {
     if (!runs || done.current) return
     done.current = true
     ;(async () => {
-      for (const r of runs.slice(0, 3)) {
+      // live Claude runs first, then cold starts (a warm start's best molecule is a tweak of a known drug), then newest
+      const pref = (r: typeof runs[number]) => (r.llm === 'anthropic' ? 2 : 0) + (r.seed_mode === 'cold' ? 1 : 0)
+      const ranked = [...runs].sort((a, b) => pref(b) - pref(a) || b.updated - a.updated)
+      setPreferred(ranked[0]?.id ?? null)
+      for (const r of ranked.slice(0, 3)) {
         try {
           const page = await api.calls(r.id, { agent: 'branch_a', limit: 60 })
           const hit = page.items.find(c => c.n_scored > 0 && Object.keys(c.rejections).length > 0)
           if (!hit) continue
           const d = await api.call(r.id, hit.call_id)
-          const bad = d.outcomes.find(o => o.gate_reason)
+          const bad = d.outcomes.find(o => o.gate_reason && o.gate_reason !== 'not_selected' && o.gate_reason !== 'policy_rejected')
           const good = d.outcomes.filter(o => o.oracle_score != null).sort((a, b) => b.oracle_score! - a.oracle_score!)[0]
           if (bad && good) return setS({ run: r.id, bad, good })
         } catch { /* try the next run */ }
       }
     })()
   }, [runs])
-  return { showcase: s, latest: runs?.[0]?.id ?? null }
+  return { showcase: s, latest: preferred ?? runs?.[0]?.id ?? null }
 }
 
-const AUC_AT = '1000'
-const auc = (r: ResultsFile | undefined, arm: 'ours' | 'ablated') => r?.[arm]?.[AUC_AT]?.mean
-const randAuc = (r: ResultsFile | undefined) => {
-  const v = Object.values(r?.random ?? {}).map(x => x[AUC_AT]).filter(x => x != null)
+const auc = (r: ResultsFile | undefined, arm: 'ours' | 'ablated', at = '1000') => r?.[arm]?.[at]?.mean
+const randAuc = (r: ResultsFile | undefined, at = '1000') => {
+  const v = Object.values(r?.random ?? {}).map(x => x[at]).filter(x => x != null)
   return v.length ? v.reduce((a, b) => a + b, 0) / v.length : undefined
 }
 
@@ -57,8 +61,15 @@ export default function Home() {
   const k = useCountUp()
   const { showcase, latest } = useShowcase()
   const { data: results } = usePoll(api.results, null, [])
-  const warm = results?.known, cold = results?.cold
-  const stats = [
+  const warm = results?.known, cold = results?.cold, live = results?.live
+  const liveArm = live && (Object.keys(live.ours).length ? live.ours : live.ablated)
+  const at = live && liveArm ? String(Math.max(...Object.keys(liveArm).map(Number))) : '1000'
+  const stats = live ? [  // live Claude results lead when they exist; the mock sets stay on the Results page
+    { c: '#2F7D52', v: liveArm?.[at]?.mean, l: `AUC-10 @${Number(at).toLocaleString()} · multi-agent, live Claude, cold start` },
+    { c: '#6F6A62', v: randAuc(live, at), l: 'Random ZINC · same budget' },
+    { c: '#2F7D52', v: live.single_call?.['50'], l: 'Single-call LLM · AUC-10 @50' },
+    { c: '#6F6A62', v: live.trigger_rounds.filter(t => t > 0).length, l: `Runs where the adversary fired (of ${live.seeds.length})`, int: true },
+  ] : [
     { c: '#2F7D52', v: auc(warm, 'ours'), l: 'AUC-10 @1,000 · warm start' },
     { c: '#6F6A62', v: auc(cold, 'ours'), l: 'AUC-10 @1,000 · cold start' },
     { c: '#2F7D52', v: randAuc(cold), l: 'Random ZINC · same budget' },
@@ -153,8 +164,11 @@ export default function Home() {
             ))}
           </div>
           <p className="mx-auto mt-6 max-w-[760px] text-center text-[13px] leading-relaxed text-[#A39D91]">
-            {warm ? `Mean of ${warm.seeds.length} seeds, ${warm.budget.toLocaleString()}-call budget, ${warm.llm_mode} LLM mode. ` : ''}
-            These come from an offline mock, not from Haiku or Sonnet, and the warm start begins with known DRD2 drugs. They test the plumbing, not the method. <Link to="/results" className="text-white">Read the caveats →</Link>
+            {live
+              ? <>Mean of {live.seeds.length} seeds, {live.budget.toLocaleString()}-call budget, live Claude (Haiku branches, Sonnet adversary), cold start from random ZINC molecules. A small sample on a single oracle: read the spread across seeds first. </>
+              : <>{warm ? `Mean of ${warm.seeds.length} seeds, ${warm.budget.toLocaleString()}-call budget, ${warm.llm_mode} LLM mode. ` : ''}
+                These come from an offline mock, not from Haiku or Sonnet, and the warm start begins with known DRD2 drugs. They test the plumbing, not the method. </>}
+            <Link to="/results" className="text-white">Read the caveats →</Link>
           </p>
         </Reveal>
       </Band>

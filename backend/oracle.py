@@ -59,7 +59,12 @@ class DRD2Oracle:
     def __init__(self, traj_path=DEFAULT_TRAJ, fail_log=DEFAULT_FAIL_LOG, report_at_exit=True):
         ensure_tdc_assets()
         from tdc import Oracle
-        self._oracle = Oracle(name="DRD2")  # cwd-independent now: model preloaded above
+        cwd = os.getcwd()
+        os.chdir(domain.DATA)  # TDC resolves its cache relative to the CWD and re-downloads 35 MB (and needs network)
+        try:                    # when it is not there, so construct it where ensure_tdc_assets() put the weights
+            self._oracle = Oracle(name="DRD2")
+        finally:
+            os.chdir(cwd)
         self.calls = 0
         self.failures = 0
         self.traj_path = Path(traj_path)
