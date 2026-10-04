@@ -85,10 +85,12 @@ class Surrogate:
             out[i] = (float(mu[j]), float(np.sqrt(var[j])))
         return out
 
-    def rank(self, smiles: list[str]) -> list[int]:
-        """Indices of `smiles`, best first by UCB. Original order when the model is not ready; unparsable last."""
+    def rank(self, smiles: list[str], beta: float | None = None) -> list[int]:
+        """Indices of `smiles`, best first by mean + beta * std (beta defaults to self.beta). Original order when the
+        model is not ready; unparsable last."""
         if not self.ready:
             return list(range(len(smiles)))
+        beta = self.beta if beta is None else beta
         preds = self.predict(smiles)
-        ucb = [(-(p[0] + self.beta * p[1]) if p else float("inf"), i) for i, p in enumerate(preds)]
+        ucb = [(-(p[0] + beta * p[1]) if p else float("inf"), i) for i, p in enumerate(preds)]
         return [i for _, i in sorted(ucb)]

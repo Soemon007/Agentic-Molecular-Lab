@@ -19,7 +19,9 @@ backend/
   chem_core.py      Candidate, Gatekeeper, scaffold-niched beam, PAINS/BRENK alerts
   oracle.py         DRD2 wrapper: global call counter, failure log, trajectory CSV
   domain.py         applicability-domain reference + ad_similarity
-  telemetry.py      adversary digest (no raw SMILES) + deterministic trigger
+  telemetry.py      adversary digest (no raw SMILES) + deterministic trigger (incl. the known-ligand AD floor)
+  planner.py        per batch: exploit vs explore, by expected gain, expected learning and cost
+  chembl.py         read-only ChEMBL lookup of a molecule's nearest neighbours' measured DRD2 activity, with citations
   surrogate.py      free Tanimoto-GP that ranks valid proposals before the quota is spent
   policies.py       Omnigent FunctionPolicy objects + PolicyGate
   llm.py            Omnigent Executors: AnthropicExecutor (Haiku/Sonnet), OfflineExecutor (mock)
@@ -29,7 +31,7 @@ backend/
   agents/           scout, branch_a/b/c, adversary, coordinator (+ offline mock)
   baselines/        random_stub.py, single_call_llm.py
   eval/             pmo_auc.py, ablation.py, run_seeds.py, live_results.py, render_results.py
-  tests/            55 tests
+  tests/            71 tests (55 were run at commit 3fa6ad8; the 16 added since have NOT been run)
 frontend/           React + Vite + Tailwind UI (see "Frontend")
 ```
 Everything runs from the repo root; data lands in `backend/data/` (gitignored except the folder skeleton).
@@ -171,7 +173,7 @@ chlorpromazine 0.51, aripiprazole 0.58, haloperidol 0.70, risperidone 0.58), and
 score 0, sit at 0.39-0.47. Across both runs the mean AD of molecules scoring 0.9 or more is 0.41 / 0.37, below every known
 ligand and flat against score (rank correlation of score and AD: +0.23 / -0.07). So either the nearest-support-vector measure has
 little dynamic range, or the optimiser reached 0.99 without moving toward the oracle's training domain; the data cannot say which.
-The trigger watches for AD *falling* over three rounds, so a run that reaches a high score at persistently low AD never trips it.
+The original trigger only watched for AD *falling* over three rounds, so a run that reached a high score at persistently low AD never tripped it; see "Adversary signal, planner and evidence step" for the change.
 No claim here should be read as "these are DRD2 binders".
 
 **What the agents do now** (`backend/agents/`, `_score_ranked` in `orchestrator.py`):
@@ -203,9 +205,48 @@ No claim here should be read as "these are DRD2 binders".
 - `DRD2Oracle()` silently downloaded 35 MB into whatever directory it was started from (TDC resolves its cache relative to the
   CWD); it now constructs the oracle where the weights live.
 
-**Still to run live:** the current agents with the adversary actually working, on the same seeds, and the single-call baseline
+**Still to run live:** the current agents with the adversary actually working (and the new trigger), on the same seeds, the evidence step, and the single-call baseline
 (`backend/baselines/single_call_llm.py`). `backend/eval/live_results.py` turns live runs into `results_cold_live.json`, which the
 Results page shows next to the mock sets.
+
+## Adversary signal, planner and evidence step (written after the live runs; NOT run)
+Everything in this section was written without running the test suite or any run, and the 16 tests added with it have not been
+run. Treat it as unverified until `pytest` and a live run have been through it.
+
+**1. A trigger the live data would have tripped** (`telemetry.py`). New condition `high_score_low_domain`: the top-10 mean score
+is at least 0.8 *and* the top-10 mean AD similarity is below the lowest AD of the five known DRD2 ligands (0.51, chlorpromazine)
+minus 0.05. It is a level, not a three-round trend, because the live runs stayed at a low AD from the first round. The 0.8 and
+0.05 were chosen by looking at those two runs (top-10 mean AD 0.41 and 0.38), so they are calibrated on the data they would have
+caught, not validated. Because the condition stays on once true, the adversary is called at most once every 5 rounds. The digest
+now carries the floor, the top-10 mean score and AD, and thiol / aminal motif counts, and the adversary's prompt describes them.
+Known weakness: the coordinator only cuts the flagged branch's quota for two rounds, so the other branches keep going.
+
+**2. A stricter plausibility filter** (`chem_core.IMPLAUSIBLE`). The Gatekeeper now rejects a free thiol (`implausible_thiol`) and
+an acyclic N,N-aminal (`implausible_aminal`) in agent proposals; seeds and the baselines are exempt. **The mock tables above
+were generated before this filter**, so they will not reproduce exactly; the live results predate it as well.
+
+**3. A planner** (`planner.py`, used in `_score_ranked`). For each batch of validated proposals it compares two tests the
+surrogate can price before any oracle call: *exploit* (rank by predicted mean) and *explore* (mean + 1.0 x std). It scores each by
+expected gain (predicted improvement over the weakest top-10 score) plus a learning weight (0.25 x budget remaining) times expected
+learning (mean predictive std), per oracle call, and picks the larger. Both options spend the same number of oracle calls, so cost
+does not separate them here. The choice and both options' numbers are logged (`plan` events) and the Run page shows the split.
+The learning weight is untuned and std is a proxy for information gain, not a measurement of it. With the surrogate unable to
+score yet (fewer than 30 labels) the agent's own order is kept.
+
+**4. An evidence step** (`chembl.py`, `agents/evidence.py`, `evidence_step` in `orchestrator.py`). At the end of a live run the
+final top 5 molecules are looked up in ChEMBL by similarity (>= 70%), and the nearest neighbours' measured activity at DRD2
+(`CHEMBL217`) is reported with links to every compound and document used. Verdicts: `analogue_active` (a neighbour with pChEMBL >= 6),
+`analogue_inactive`, `analogue_untested`, `no_analogue`, `unavailable`. This is a check of nearby compounds, not a measurement of the
+molecule, and `no_analogue` does not distinguish a novel chemotype from a classifier artifact. The lookup is a real Omnigent
+`FunctionTool` on an `evidence` specialist, called through the same policy gate as everything else; a new `evidence_cap` policy
+allows it only for that agent, with one SMILES of at most 500 characters, at most 20 times per run. Failures return `unavailable`
+and never stop a run. It is on for live runs and off for the mock (`--evidence` / `--no-evidence`, `POST /api/runs`). The ChEMBL
+endpoints and field names were read from the live API; the code was not run end to end.
+
+**What is still not done: Omnigent does not orchestrate.** Omnigent's real runtime is a server and runner stack (processes,
+sessions, authentication), not a library call, and it could not be wired in without running it. The specialists remain Omnigent
+`AgentDef`s with Omnigent tools and policies, driven by this repo's own loop. The brief's "choose between competing tests" is
+covered only in the narrow sense of item 3.
 
 ## Disclosures
 1. **Versions and reference table.** PyTDC **1.1.15** (rdkit 2026.3.6, scikit-learn 1.9.1, numpy 2.3.5). The
@@ -233,8 +274,9 @@ Results page shows next to the mock sets.
 | branch_c (Explorer) | Haiku | bioisosteres from lower-percentile beam entries | `submit_proposals` |
 | adversary | Sonnet | only when triggered: one-sentence exploit diagnosis + corrective instruction, from a telemetry digest (no raw SMILES) | `submit_diagnosis` |
 | coordinator | none (code) | quotas 4/4/4; flagged branch → 1 (never 0), remainder redistributed, instruction injected, two-round cooldown | — |
+| evidence | none (tool only) | end of a live run: ChEMBL check of the final top 5 hits, with citations | `lookup_chembl` (a real HTTP lookup) |
 
-Agents are Omnigent `AgentDef`s run through Omnigent `Executor`s. Each agent's only tool echoes its structured output back; none can read or compute anything. **Not used:** Omnigent's server/CLI runtime —
+Agents are Omnigent `AgentDef`s run through Omnigent `Executor`s. Every agent's tool except the evidence specialist's just echoes its structured output back; none of them can read or compute anything. **Not used:** Omnigent's server/CLI runtime —
 its executors need provider credentials, so the session is a `LabSession` dataclass plus Omnigent's
 `SessionState` enum. The Gatekeeper makes no LLM calls.
 
@@ -245,7 +287,9 @@ its executors need provider credentials, so the session is a `LabSession` datacl
 3. **electrophile_approval** — a BRENK *electrophile* alert (Michael acceptors, alkyl/N-halides, aldehydes,
    etc.) ASKs for human approval; `AUTOPILOT=true` logs and auto-rejects. Other BRENK alerts and PAINS are
    telemetry for the adversary only and never pause the run.
-Gatekeeper rejections are logged by branch **and reason** (e.g. `ring_count_change` vs `scaffold_change`).
+4. **evidence_cap** — `lookup_chembl`, the one tool that reaches the network, takes one SMILES of at most 500 characters
+   and runs at most 20 times per run; only the `evidence` agent may call it.
+Gatekeeper rejections are logged by branch **and reason** (e.g. `ring_count_change`, `scaffold_change`, `implausible_thiol`).
 
 ## Logging for tuning agent behaviour
 `backend/data/chats/<run_id>.jsonl`: one `agent_call` record per call (system prompt, input payload, output,

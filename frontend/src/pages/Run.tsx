@@ -76,7 +76,55 @@ function RunView({ id }: { id: string }) {
         <BeamSection s={s} />
         <Reveal><Charts s={s} /></Reveal>
         <Reveal><div className="grid items-start gap-5 [grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr))]"><Agents s={s} /><Policy s={s} /></div></Reveal>
+        {s.evidence?.length > 0 && <Reveal><EvidenceSection items={s.evidence} /></Reveal>}
         <div className="text-center text-sm text-mute">Every call, prompt and verdict of this run is in the <Link to={`/inspector/${id}`} className="text-ink">Inspector</Link>.</div>
+      </div>
+    </div>
+  )
+}
+
+const VERDICT: Record<string, { tone: 'ok' | 'ask' | 'deny' | 'soft'; label: string; note: string }> = {
+  analogue_active: { tone: 'ok', label: 'Similar compound is active', note: 'A close ChEMBL analogue has measured DRD2 potency of 1 µM or better.' },
+  analogue_inactive: { tone: 'ask', label: 'Similar compounds are weak', note: 'Close analogues were measured at DRD2 and none reached 1 µM.' },
+  analogue_untested: { tone: 'ask', label: 'Similar compounds untested at DRD2', note: 'Close analogues exist in ChEMBL but have no DRD2 measurement.' },
+  no_analogue: { tone: 'deny', label: 'No known analogue', note: 'Nothing in ChEMBL is this similar: novel, or an artifact of the classifier.' },
+  unavailable: { tone: 'soft', label: 'Check unavailable', note: 'ChEMBL could not be reached or answered unexpectedly.' },
+  blocked: { tone: 'deny', label: 'Blocked by policy', note: 'The evidence policy refused this lookup.' },
+}
+
+function EvidenceSection({ items }: { items: RunState['evidence'] }) {
+  return (
+    <div className="card">
+      <div className="text-lg font-bold">Independent check of the best molecules</div>
+      <div className="mb-4 mt-[3px] text-sm text-mute">Looked up in ChEMBL (EMBL-EBI) by similarity, against measured DRD2 activity. This is an agent-generated check of nearby compounds, not a measurement of the molecule itself.</div>
+      <div className="flex flex-col gap-4">
+        {items.map(e => {
+          const v = VERDICT[e.verdict] ?? VERDICT.unavailable
+          return (
+            <div key={e.id} className="rounded-[22px] border border-line p-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="grid h-[84px] w-[110px] flex-none place-items-center rounded-[16px] border border-line bg-soft p-1"><Mol smiles={e.smiles} w={130} h={80} /></div>
+                <div className="min-w-[220px] flex-1">
+                  <div className="flex flex-wrap items-center gap-2"><Badge tone={v.tone}>{v.label.toUpperCase()}</Badge><Chip strong>DRD2 {f2(e.oracle_score)}</Chip><Chip>AD {f2(e.ad_similarity)}</Chip></div>
+                  <div className="mt-1.5 text-[13px] leading-snug text-mute">{e.error ? `${v.note} ${e.error}` : v.note}</div>
+                </div>
+              </div>
+              {e.neighbours.length > 0 && (
+                <ul className="m-0 mt-3 list-none space-y-1 p-0 text-[13px]">
+                  {e.neighbours.slice(0, 4).map(n => (
+                    <li key={n.chembl_id} className="flex flex-wrap items-baseline gap-x-2">
+                      <a href={n.url} target="_blank" rel="noreferrer" className="mono text-ink">{n.chembl_id}</a>
+                      <span className="text-mute">{n.name ?? 'unnamed'} · {n.similarity != null ? `${n.similarity.toFixed(0)}% similar` : 'similar'} · {n.drd2_activities ? `${n.drd2_activities} DRD2 measurement${n.drd2_activities === 1 ? '' : 's'}, best pChEMBL ${n.drd2_pchembl_max ?? '–'}` : 'no DRD2 measurement'}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {e.documents.length > 0 && (
+                <div className="mt-2 text-[13px] text-mute">Sources: {e.documents.map((d, i) => <span key={d.chembl_id}>{i ? ', ' : ''}<a href={d.url} target="_blank" rel="noreferrer" className="text-ink">{d.chembl_id}</a></span>)}</div>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )
@@ -279,6 +327,7 @@ function Policy({ s }: { s: RunState }) {
       <div className="card">
         <div className="text-lg font-bold">Gatekeeper rejections</div>
         <div className="mb-4 mt-[3px] text-sm text-mute">Proposals stopped on chemistry before they could cost a call.</div>
+        {(s.planner?.exploit || s.planner?.explore) ? <div className="mb-3 text-sm text-mute">Planner: of {(s.planner.exploit ?? 0) + (s.planner.explore ?? 0)} batches it could score, it chose to exploit {s.planner.exploit ?? 0} and explore {s.planner.explore ?? 0} (by expected gain plus expected learning).</div> : null}
         {notSelected > 0 && <div className="mb-3 text-sm text-mute">{fmt(notSelected)} further proposals were valid but ranked below the quota by the surrogate, so they were not scored (and can be proposed again).</div>}
         {rej.length === 0 ? <div className="text-sm text-mute">None yet.</div> : (
           <div className="flex flex-col gap-2.5">

@@ -13,9 +13,16 @@ export interface BeamMol { rank: number; smiles: string; score: number; ad: numb
 export interface RoundRec { round: number; oracle_calls_used: number; best: number; top10_mean: number; sa_top10: number; ad_top10: number; scaffolds_in_beam: number; quotas?: Record<string, number>; trigger?: string[] }
 export interface Trigger {
   round: number; fired: string[]; flagged: string | null; acted: boolean; diagnosis?: string; instruction?: string; skipped?: string
-  stats: { unique_scaffolds_top10: number; dominant_branch: string; sa_trend_3r: number; ad_similarity_trend: number; oracle_calls_used: number; round: number }
+  stats: { unique_scaffolds_top10: number; dominant_branch: string; sa_trend_3r: number; ad_similarity_trend: number; oracle_calls_used: number; round: number; top10_mean_score?: number; top10_mean_ad?: number; ad_known_ligand_floor?: number | null }
 }
 export interface FeedItem { agent: string; round: number | null; ts: string; text: string; smiles: string | null; allowed: boolean }
+export interface EvidenceNeighbour { chembl_id: string; name: string | null; similarity: number | null; smiles: string | null; drd2_activities: number; drd2_pchembl_max: number | null; url: string }
+export interface Evidence {
+  id: string; smiles: string; oracle_score: number; ad_similarity: number | null; origin: string
+  verdict: 'analogue_active' | 'analogue_inactive' | 'analogue_untested' | 'no_analogue' | 'unavailable' | 'blocked'
+  label?: string; source?: string; target?: string; cutoff_percent?: number; error: string | null
+  neighbours: EvidenceNeighbour[]; documents: { chembl_id: string; url: string }[]
+}
 export interface Approval { id: string; status: 'pending' | 'approved' | 'rejected'; reason: string; branch: string | null; smiles: string | null; alerts: string[] }
 export interface PolicyEvent { round: number; verdict: 'ASK' | 'DENY'; policy?: string; agent?: string; tool?: string; reason: string; approved?: boolean; smiles?: string; branch?: string; ts?: string }
 
@@ -27,7 +34,7 @@ export interface RunState {
   beam: BeamMol[]; curve: [number, number, number][]; auc: number | null
   rounds: RoundRec[]; triggers: Trigger[]
   agents: Record<string, { calls: number; denied: number; tokens: number }>
-  gatekeeper: Record<string, number>; feed: FeedItem[]
+  gatekeeper: Record<string, number>; feed: FeedItem[]; planner: Record<string, number>; evidence: Evidence[]
   policy: { events: PolicyEvent[]; ask: number; ask_approved: number; deny: number; agent_denied: number; oracle_rejected: number; recorded: boolean; pending: Approval[] }
 }
 

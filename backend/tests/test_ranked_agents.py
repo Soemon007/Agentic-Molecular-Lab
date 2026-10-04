@@ -145,7 +145,7 @@ def test_each_branch_quota_is_spent_on_ranked_proposals_and_the_rest_are_not_bur
 def test_selection_follows_the_rankers_order_not_the_order_the_agent_wrote_proposals(tmp_path, monkeypatch):
     """Plant a ranker that prefers short SMILES; within every call the scored proposals must be the shortest valid ones."""
     import orchestrator
-    monkeypatch.setattr(orchestrator.Surrogate, "rank", lambda self, smi: sorted(range(len(smi)), key=lambda i: len(smi[i])))
+    monkeypatch.setattr(orchestrator.Surrogate, "rank", lambda self, smi, beta=None: sorted(range(len(smi)), key=lambda i: len(smi[i])))
     _, log = _run(tmp_path, budget=150, name="ranker_plant")
     outs = [r for r in log if r["kind"] == "proposal_outcome"]
     checked = 0

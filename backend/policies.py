@@ -4,6 +4,7 @@ These run in code on every tool call, regardless of what any prompt says:
   1. write_permission     — only the oracle wrapper writes scores; agents get only their own tool
   2. budget_cap           — hard stop at the oracle-call ceiling
   3. electrophile_approval — electrophile alert pauses for human approval (AUTOPILOT=true: log + auto-reject)
+  4. evidence_cap         — the one tool that reaches the network (lookup_chembl) is capped and takes one SMILES only
 Policy events are appended to backend/data/policy_events.jsonl.
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ AUTOPILOT = os.getenv("AUTOPILOT", "false").lower() == "true"
 AGENT_TOOLS = {  # the ONLY tool each agent may call
     "scout": "submit_brief", "branch_a": "submit_proposals", "branch_b": "submit_proposals",
     "branch_c": "submit_proposals", "adversary": "submit_diagnosis", "coordinator": "submit_plan",
-    "oracle": "oracle_evaluate",
+    "oracle": "oracle_evaluate", "evidence": "lookup_chembl",
 }
 SCORE_KEYS = {"score", "fitness", "oracle_score", "drd2", "predicted_score"}
 
@@ -62,6 +63,24 @@ def electrophile_approval(event: dict):
     if flagged:  # BRENK non-electrophile alerts / PAINS are telemetry only and never reach here
         return {"result": "ASK", "reason": f"electrophile alert(s): {', '.join(flagged)}"}
     return {"result": "ALLOW"}
+
+
+def make_evidence_cap(max_calls: int = 20):
+    """lookup_chembl is the only tool that reaches the network: cap how often it runs and what it may send."""
+    used = {"n": 0}
+
+    def evidence_cap(event: dict):
+        d = event["data"]
+        if event["type"] != "tool_call" or d.get("tool") != "lookup_chembl":
+            return None
+        smi = d.get("arguments", {}).get("smiles")
+        if not isinstance(smi, str) or not smi or len(smi) > 500:
+            return {"result": "DENY", "reason": "lookup_chembl takes one SMILES string of at most 500 characters"}
+        if used["n"] >= max_calls:
+            return {"result": "DENY", "reason": f"evidence lookups are capped at {max_calls} per run"}
+        used["n"] += 1
+        return {"result": "ALLOW"}
+    return evidence_cap
 
 
 @dataclass
@@ -127,4 +146,5 @@ def build_gate(oracle, ceiling: int, log_path=None, autopilot=None, approver=Non
         FunctionPolicy(name="write_permission", on=["tool_call"], callable=write_permission),
         FunctionPolicy(name="budget_cap", on=["tool_call"], callable=make_budget_cap(oracle, ceiling)),
         FunctionPolicy(name="electrophile_approval", on=["tool_call"], callable=electrophile_approval),
+        FunctionPolicy(name="evidence_cap", on=["tool_call"], callable=make_evidence_cap()),
     ], log_path=log_path, autopilot=autopilot, approver=approver)

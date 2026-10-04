@@ -14,7 +14,8 @@ import chem_core
 
 BRANCH_LABEL = {"branch_a": "local", "branch_b": "hopper", "branch_c": "explorer", "seed": "seed"}
 TREND_WINDOW = 3
-TRIGGER = {"unique_scaffolds_top10_lt": 3, "sa_trend_3r_gt": 1.2, "ad_similarity_trend_lt": -0.15}
+TRIGGER = {"unique_scaffolds_top10_lt": 3, "sa_trend_3r_gt": 1.2, "ad_similarity_trend_lt": -0.15,
+           "high_score_ge": 0.8, "ad_floor_margin": 0.05}
 
 _MOTIFS = {
     "basic_amine": "[NX3;!$(N-C=[O,S,N]);!$(N-a);!$(N-S(=O)=O);!$(N-[#7,#8])]",
@@ -22,8 +23,24 @@ _MOTIFS = {
     "carboxylic_acid": "C(=O)[OH]",
     "halogen": "[F,Cl,Br,I]",
     "aryl_ring": "a1aaaaa1",
+    "thiol": "[SX2H1]",
+    "aminal": "[NX3;!$(N-C=[O,S,N]);!$(N-S(=O)=O)]-[CX4;!R]-[NX3;!$(N-C=[O,S,N]);!$(N-S(=O)=O)]",
 }
 _MOTIF_Q = {k: Chem.MolFromSmarts(v) for k, v in _MOTIFS.items()}
+
+
+_FLOOR: float | None = None
+
+
+def known_ligand_ad_floor() -> float:
+    """The lowest AD similarity among the 5 known DRD2 ligands (0.51, chlorpromazine). Measured, not chosen: the live
+    runs' molecules scoring >= 0.9 sat at 0.37-0.41, below every known ligand and flat against score, which the
+    three-round-trend conditions below cannot see. Needs the oracle's support vectors (loads them on first use)."""
+    global _FLOOR
+    if _FLOOR is None:
+        import domain
+        _FLOOR = min(domain.ad_similarity(Chem.MolFromSmiles(s)) for s in chem_core.SEEDS.values())
+    return _FLOOR
 
 
 def motifs(mol) -> dict:
@@ -44,7 +61,8 @@ def trend(history: list[dict], key: str, rnd: int) -> float:
     return float(history[rnd][key] - history[rnd - TREND_WINDOW][key])
 
 
-def build_digest(beam, history: list[dict], rnd: int, oracle_calls_used: int, k: int = 10) -> dict:
+def build_digest(beam, history: list[dict], rnd: int, oracle_calls_used: int, k: int = 10,
+                 ad_floor: float | None = None) -> dict:
     top = beam.top(k)
     top_k = []
     for c in top:
@@ -60,12 +78,20 @@ def build_digest(beam, history: list[dict], rnd: int, oracle_calls_used: int, k:
         "dominant_branch": f"{BRANCH_LABEL.get(dom, dom)} {n_dom}/{len(top)}",
         "sa_trend_3r": round(trend(history, "sa_top10", rnd), 3),
         "ad_similarity_trend": round(trend(history, "ad_top10", rnd), 3),
+        "top10_mean_score": round(sum(c.score or 0 for c in top) / max(len(top), 1), 3),
+        "top10_mean_ad": round(sum(c.ad_similarity or 0 for c in top) / max(len(top), 1), 3),
+        "ad_known_ligand_floor": None if ad_floor is None else round(ad_floor, 3),
         "oracle_calls_used": oracle_calls_used, "round": rnd}}
 
 
 def trigger(digest: dict) -> list[str]:
     """Deterministic: returns the list of fired conditions (empty = no trigger).
-    unique_scaffolds_top10 < 3 OR sa_trend_3r > 1.2 OR ad_similarity_trend < -0.15"""
+    unique_scaffolds_top10 < 3 OR sa_trend_3r > 1.2 OR ad_similarity_trend < -0.15
+    OR (top-10 mean score >= 0.8 AND top-10 mean AD similarity < known-ligand floor - 0.05)
+
+    The last condition is a level, not a trend: a run can reach a high score while staying at a low AD similarity from
+    the first round, which no change-over-three-rounds condition sees. 0.8 and 0.05 were chosen by looking at two live
+    runs (top-10 mean AD 0.41 and 0.38 against a floor of 0.51), so they are not validated on other data."""
     s, fired = digest["stats"], []
     if s["unique_scaffolds_top10"] < TRIGGER["unique_scaffolds_top10_lt"]:
         fired.append("low_scaffold_diversity")
@@ -73,6 +99,10 @@ def trigger(digest: dict) -> list[str]:
         fired.append("sa_creep")
     if s["ad_similarity_trend"] < TRIGGER["ad_similarity_trend_lt"]:
         fired.append("ad_similarity_drop")
+    floor = s.get("ad_known_ligand_floor")
+    if (floor is not None and s.get("top10_mean_score", 0) >= TRIGGER["high_score_ge"]
+            and s.get("top10_mean_ad", 1) < floor - TRIGGER["ad_floor_margin"]):
+        fired.append("high_score_low_domain")
     return fired
 
 

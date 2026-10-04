@@ -35,7 +35,7 @@ from orchestrator import run_lab, summarize
 
 CHATS, TRAJ, RUNS_DIR = DATA / "chats", DATA / "trajectories", DATA / "runs"
 DIST = Path(__file__).resolve().parents[1] / "frontend" / "dist"
-AGENT_ORDER = ["scout", "branch_a", "branch_b", "branch_c", "coordinator", "adversary"]
+AGENT_ORDER = ["scout", "branch_a", "branch_b", "branch_c", "coordinator", "adversary", "evidence"]
 NAME_RE = re.compile(r"^(?:(?P<arm>ours|ablated|adv|noadv)_)?(?P<br>[abc]+)(?:_(?P<sm>known|cold))?_seed(?P<seed>\d+)$")
 
 app = FastAPI(title="Agentic Molecular Lab API")
@@ -173,6 +173,8 @@ def _call_summary(r: dict, outs: list[dict]) -> dict:
         title = (args.get("brief") or "(empty brief)")[:140]
     elif agent == "adversary":
         title = args.get("diagnosis") or "(no diagnosis)"
+    elif agent == "evidence":
+        title = f"ChEMBL check, {str(args.get('verdict', '?')).replace('_', ' ')}: {str(args.get('smiles') or '')[:70]}"
     elif outs:
         title = f"{len(outs)} proposals · {len(scored)} scored · {len(outs) - len(scored)} rejected"
     else:
@@ -248,6 +250,8 @@ def _state(run_id: str) -> dict:
     rounds = [e for e in events if e["event"] == "round"]
     triggers = [e for e in events if e["event"] == "adversary_trigger"]
     policy = [e for e in events if e["event"] == "policy"]
+    plans = [e for e in events if e["event"] == "plan" and e.get("decided")]
+    evidence = next((e.get("results", []) for e in reversed(events) if e["event"] == "evidence"), [])
     summaries = [_call_summary(r, outs.get(r["call_id"], [])) for r in calls]
     tin = sum(s["tokens_in"] for s in summaries)
     tout = sum(s["tokens_out"] for s in summaries)
@@ -284,6 +288,8 @@ def _state(run_id: str) -> dict:
         "triggers": [{k: e.get(k) for k in ("round", "fired", "flagged", "acted", "diagnosis", "instruction", "stats", "skipped")}
                      for e in triggers],
         "agents": by_agent, "gatekeeper": dict(gate), "feed": feed,
+        "planner": dict(Counter(p["chosen"] for p in plans)),  # batches the planner decided between: exploit vs explore
+        "evidence": evidence,  # ChEMBL checks of the final top hits (live runs)
         "policy": {
             "events": [{k: e.get(k) for k in ("round", "verdict", "policy", "agent", "tool", "reason", "approved", "smiles", "branch", "ts")}
                        for e in policy[-12:]],
@@ -304,6 +310,7 @@ class StartRun(BaseModel):
     seed_mode: str = Field("known", pattern="^(known|cold)$")
     seed: int = Field(0, ge=0, le=999)
     ask_human: bool = False  # False = AUTOPILOT semantics: log electrophile asks and auto-reject
+    evidence: bool | None = None  # check the final top hits against ChEMBL; None = on for live runs, off for the mock
 
 
 @app.get("/api/config")
@@ -355,7 +362,7 @@ def _worker(h: Handle):
     try:
         sess = asyncio.run(run_lab(
             budget=cfg["budget"], branches=cfg["branches"], llm=cfg["llm"], seed=cfg["seed"], verbose=False,
-            adversary=cfg["adversary"], seed_mode=cfg["seed_mode"], run_id=h.id, approver=approver,
+            adversary=cfg["adversary"], seed_mode=cfg["seed_mode"], run_id=h.id, approver=approver, evidence=cfg.get("evidence"),
             should_stop=lambda: h.stop))
         h.summary = summarize(sess)
         if sess.stalled and sess.stall_is_error:  # agent calls failed (e.g. a rejected API request): that is a failure, not "budget spent"

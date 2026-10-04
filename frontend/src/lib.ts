@@ -12,10 +12,11 @@ const AGENTS: Record<string, AgentMeta> = {
   branch_c: { key: 'branch_c', name: 'Branch C · explorer', ini: 'C', bg: '#D8D3C8', fg: '#14130F' },
   coordinator: { key: 'coordinator', name: 'Coordinator', ini: 'Co', bg: '#4A463F', fg: '#fff' },
   adversary: { key: 'adversary', name: 'Adversary', ini: 'Ad', bg: 'transparent', fg: 'var(--deny)', outlined: true },
+  evidence: { key: 'evidence', name: 'Evidence', ini: 'Ev', bg: '#1F5C3B', fg: '#fff' },
   seed: { key: 'seed', name: 'Seed molecule', ini: '·', bg: 'var(--sec)', fg: 'var(--ink)' },
 }
 export const agentMeta = (k: string): AgentMeta => AGENTS[k] ?? { key: k, name: k, ini: k.slice(0, 1).toUpperCase(), bg: 'var(--soft)', fg: 'var(--ink)' }
-export const AGENT_KEYS = ['scout', 'branch_a', 'branch_b', 'branch_c', 'coordinator', 'adversary']
+export const AGENT_KEYS = ['scout', 'branch_a', 'branch_b', 'branch_c', 'coordinator', 'adversary', 'evidence']
 
 const REASONS: Record<string, string> = { not_selected: 'valid, ranked below the quota', policy_rejected: 'stopped by a policy' }
 export const humanReason = (r: string) => REASONS[r] ?? r.replace(/_/g, ' ')
@@ -24,6 +25,7 @@ export const TRIGGER_TEXT: Record<string, string> = {
   low_scaffold_diversity: 'fewer than 3 distinct scaffolds in the top 10',
   sa_creep: 'synthetic accessibility is creeping up',
   ad_similarity_drop: 'molecules are drifting out of the oracle’s domain',
+  high_score_low_domain: 'high scores at an applicability-domain similarity below every known ligand',
 }
 
 /** Poll an async loader. Keeps the previous value on error/refresh so the UI never flashes empty. */

@@ -3,7 +3,8 @@ from chem_core import MAX_LOGP, MAX_MW
 
 BRANCH_NOTES = (
     f"\n\nA filter silently discards proposals that break these limits: MW <= {MAX_MW:.0f}, logP <= {MAX_LOGP:.0f} (each beam "
-    "row shows mw and logp), an unparsable SMILES, or any molecule that was already scored. So never re-propose a beam "
+    "row shows mw and logp), an unparsable SMILES, a free thiol (-SH), an acyclic N,N-aminal (N-CH(R)-N), or any "
+    "molecule that was already scored. So never re-propose a beam "
     "member or anything in `recent_results` or `do_not_repeat` (molecules proposed again and again), or trivial variants. "
     "`recent_results` holds [smiles, score, delta vs parent] for recent proposals from all branches: avoid the edits that "
     "lowered the score and build on the ones that raised it. `your_recent_rejections` holds your own proposals the filter "

@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import random
+import time
 from dataclasses import dataclass, field
 
 from omnigent.inner.datamodel import SessionState
@@ -24,6 +25,7 @@ import chem_core
 from chem_core import Candidate, Gatekeeper, ScaffoldBeam, SEEDS
 from agents import REGISTRY
 from agents.coordinator import Coordinator
+import planner
 import telemetry
 from agents.base import run_agent
 from llm import TokenLedger, llm_mode, make_executor
@@ -56,6 +58,9 @@ class LabSession:
     recent: list = field(default_factory=list)  # per round, the oracle's verdicts on that round's scored proposals
     last_rejects: dict = field(default_factory=dict)  # branch -> its own fixable rejections from last round
     surrogate: Surrogate = field(default_factory=Surrogate)
+    ad_floor: float | None = None  # lowest AD similarity among the known DRD2 ligands (telemetry.known_ligand_ad_floor)
+    last_adversary_round: int = -99
+    evidence: list = field(default_factory=list)  # ChEMBL checks of the final top hits (live runs)
     coordinator: object = None
     trigger_log: list = field(default_factory=list)
     adversary_calls: int = 0
@@ -107,7 +112,10 @@ def beam_payload(beam, n, extra=None, limit=20):
 
 
 RECENT_ROUNDS, RECENT_MAX, REJECT_MAX, HOT_MAX = 2, 16, 4, 20
-FIXABLE = {"invalid_smiles", "logp", "mw", "ring_count_change", "scaffold_change", "scaffold_unchanged"}
+FIXABLE = {"invalid_smiles", "logp", "mw", "ring_count_change", "scaffold_change", "scaffold_unchanged",
+           "implausible_thiol", "implausible_aminal"}
+ADVERSARY_MIN_GAP = 5  # rounds between adversary calls: a level-type trigger (high score at low AD) stays on for good
+EVIDENCE_TOP_K = 5
 
 
 def recent_results(sess) -> list:
@@ -202,8 +210,15 @@ async def _score_ranked(sess, gate, name, r, quota, by_id, rnd, scored, verdicts
                 fixable.append([p.get("smiles"), reason.replace("_", " ")])
             continue
         valid.append((p, parent, mol, out))
-    preds = sess.surrogate.predict([chem_core.Chem.MolToSmiles(v[2]) for v in valid])
-    order = sess.surrogate.rank([chem_core.Chem.MolToSmiles(v[2]) for v in valid])
+    smiles = [chem_core.Chem.MolToSmiles(v[2]) for v in valid]
+    preds = sess.surrogate.predict(smiles)
+    top = sess.beam.top(10)
+    choice, options = planner.plan(preds, quota, lambda beta: sess.surrogate.rank(smiles, beta=beta),
+                                   top[-1].score if top else 0.0, (sess.budget - sess.oracle.calls) / sess.budget)
+    order = choice.order  # exploit or explore, whichever the planner expects to be worth more
+    if valid and sess.chatlog:
+        sess.chatlog.event("plan", round=rnd, agent=name, chosen=choice.name, decided=choice.feasible,
+                           options=[planner.summary(o) for o in options])
     taken = 0
     for k, i in enumerate(order):
         p, parent, mol, out = valid[i]
@@ -231,13 +246,16 @@ async def _score_ranked(sess, gate, name, r, quota, by_id, rnd, scored, verdicts
 
 async def adversary_step(sess, gate, executor, rnd):
     """Deterministic trigger (free). Sonnet adversary + coordinator only when it fires."""
-    digest = telemetry.build_digest(sess.beam, sess.history, rnd, sess.oracle_calls_used)
+    digest = telemetry.build_digest(sess.beam, sess.history, rnd, sess.oracle_calls_used, ad_floor=sess.ad_floor)
     fired = telemetry.trigger(digest)
     blame = telemetry.flagged_branch(sess.beam) if fired else None
     rec = {"round": rnd, "fired": fired, "flagged": blame, "acted": False, "stats": digest["stats"]}
     if fired and blame and sess.coordinator.in_cooldown(blame):
         rec["skipped"] = "cooldown"
+    elif fired and blame and sess.adversary_enabled and rnd - sess.last_adversary_round < ADVERSARY_MIN_GAP:
+        rec["skipped"] = "rate_limit"
     elif fired and blame and sess.adversary_enabled:
+        sess.last_adversary_round = rnd
         r = await run_agent(REGISTRY["adversary"], executor, digest, gate, sess.ledger, temperature=0.0,
                             chatlog=sess.chatlog, rnd=rnd)
         sess.adversary_calls += 1
@@ -250,9 +268,39 @@ async def adversary_step(sess, gate, executor, rnd):
     return rec
 
 
+async def evidence_step(sess, gate, top_k: int = EVIDENCE_TOP_K) -> list[dict]:
+    """The evidence specialist checks the final top hits against ChEMBL. Each lookup is a tool call that goes through the
+    same policy gate as every other agent (it may call lookup_chembl and nothing else, capped per run), and is logged as an
+    agent call so the Inspector shows it with its result."""
+    agent = REGISTRY["evidence"]
+    tool = agent.tools["lookup_chembl"]
+
+    async def one(c):
+        t0 = time.time()
+        verdict = await gate.check("tool_call", {"tool": "lookup_chembl", "agent": "evidence",
+                                                 "arguments": {"smiles": c.smiles}})
+        res = (await tool.callable(smiles=c.smiles) if verdict.allowed
+               else {"smiles": c.smiles, "verdict": "blocked", "error": verdict.reason, "neighbours": [], "documents": []})
+        res = {**res, "id": c.id, "oracle_score": round(c.score, 3), "origin": c.origin_branch,
+               "ad_similarity": None if c.ad_similarity is None else round(c.ad_similarity, 3)}
+        if sess.chatlog:
+            sess.chatlog.agent_call(call_id=sess.chatlog.new_call_id(), round=sess.round, agent="evidence",
+                                    model="none (tool only)", system_prompt=agent.prompt,
+                                    input={"smiles": c.smiles, "oracle_score": res["oracle_score"]},
+                                    output={"tool": "lookup_chembl", "args": res}, usage=None,
+                                    latency_ms=int((time.time() - t0) * 1000),
+                                    verdict={"allowed": verdict.allowed, "reason": verdict.reason})
+        return res
+
+    results = list(await asyncio.gather(*(one(c) for c in sess.beam.top(top_k))))
+    if sess.chatlog:
+        sess.chatlog.event("evidence", round=sess.round, results=results)
+    return results
+
+
 async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_path=None, verbose=True,
                   noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None, seed_mode="known",
-                  approver=None, should_stop=None):
+                  approver=None, should_stop=None, evidence=None):
     from oracle import DRD2Oracle
     random.seed(seed)
     run_id = run_id or f"{'adv' if adversary else 'noadv'}_{branches}_{seed_mode}_seed{seed}"
@@ -273,6 +321,7 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
         executor.noise, executor.exploit = noise, exploit
     seed_beam(oracle, sess.beam, sess.gatekeeper, seed_mode, seed)
     sess.labels = [(c.smiles, c.score) for c in sess.beam.members]  # the seeds are the surrogate's first labels
+    sess.ad_floor = telemetry.known_ligand_ad_floor()
     sess.history.append({**telemetry.snapshot(sess.beam), "round": 0})  # history[r] == round r
     sess.chatlog.event("round", **sess.history[0], oracle_calls_used=oracle.calls,
                        best=round(sess.beam.top(1)[0].score, 4))
@@ -302,6 +351,13 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
             sess.stall_reason = (f"agent calls are failing ({sess.round_agent_error})" if sess.stall_is_error
                                  else "the Gatekeeper and policies rejected every proposal")
             break
+    # Independent check of the best molecules. On by default for live runs only: the mock's molecules are not worth a
+    # network call, and tests must not need one. A lookup that fails is recorded, never raised.
+    if (((llm or llm_mode()) == "anthropic") if evidence is None else evidence) and not (should_stop and should_stop()):
+        try:
+            sess.evidence = await evidence_step(sess, gate)
+        except Exception as e:
+            sess.chatlog.event("evidence_error", error=f"{type(e).__name__}: {e}")
     sess.state = SessionState.COMPLETED
     oracle.report()
     oracle._fh.flush()
@@ -313,7 +369,7 @@ def summarize(sess: LabSession) -> dict:
            "rejections": sess.gatekeeper.rejection_report(), "accepted": dict(sess.gatekeeper.accepted),
            "policy_counts": sess.gate.counts, "tokens": sess.ledger.as_dict(),
            "trigger_rounds": sum(1 for t in sess.trigger_log if t["fired"]),
-           "adversary_calls": sess.adversary_calls, "stalled": sess.stalled, "stall_reason": sess.stall_reason,
+           "adversary_calls": sess.adversary_calls, "stalled": sess.stalled, "stall_reason": sess.stall_reason, "evidence": [e.get("verdict") for e in sess.evidence],
            "rounds": len(sess.history) - 1}
     by_branch = {}
     for c in sess.all_candidates:
@@ -335,9 +391,12 @@ if __name__ == "__main__":
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--noise", type=float, default=1.0, help="offline mock: rate of rule-violating proposals")
     ap.add_argument("--seed-mode", choices=["known", "cold"], default="known")
+    ap.add_argument("--evidence", action=argparse.BooleanOptionalAction, default=None,
+                    help="check the final top hits against ChEMBL (default: on for live runs, off for the mock)")
     ap.add_argument("--no-adversary", action="store_true")
     ap.add_argument("--exploit", action="store_true", help="offline mock: Explorer reward-hacks (demo only)")
     a = ap.parse_args()
     s = asyncio.run(run_lab(a.budget, a.branches, a.quota, a.llm, a.seed, noise=a.noise,
-                         adversary=not a.no_adversary, exploit=a.exploit, seed_mode=a.seed_mode))
+                         adversary=not a.no_adversary, exploit=a.exploit, seed_mode=a.seed_mode,
+                            evidence=a.evidence))
     print(json.dumps(summarize(s), indent=2))

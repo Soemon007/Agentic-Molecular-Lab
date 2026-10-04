@@ -118,6 +118,18 @@ def electrophile_alerts(alerts: list[str]) -> list[str]:
     return [a for a in alerts if a.startswith("BRENK:") and a.split(":", 1)[1] in ELECTROPHILE_ALERTS]
 
 
+# --------------------------------------------------------------------------- plausibility
+
+# Groups the LLM branches kept producing that a medicinal chemist rejects on sight: the live seed-1 run's ten best
+# molecules (all score 0.99) carried a free aryl thiol and an acyclic N,N-aminal. Applied to agent proposals only,
+# never to seeds or the baselines.
+_AMINE = "[NX3;!$(N-C=[O,S,N]);!$(N-S(=O)=O)]"
+IMPLAUSIBLE = {
+    "thiol": Chem.MolFromSmarts("[SX2H1]"),
+    "aminal": Chem.MolFromSmarts(f"{_AMINE}-[CX4;!R]-{_AMINE}"),
+}
+
+
 # --------------------------------------------------------------------------- branch rules
 
 def is_valid_branch_a(mol, parent_mol) -> bool:
@@ -161,6 +173,10 @@ class Gatekeeper:
             return self._reject(branch, "mw")
         if Descriptors.MolLogP(mol) > self.max_logp:
             return self._reject(branch, "logp")
+        if branch.startswith("branch_"):
+            for group, patt in IMPLAUSIBLE.items():
+                if mol.HasSubstructMatch(patt):
+                    return self._reject(branch, f"implausible_{group}")
         can = Chem.MolToSmiles(mol)
         if can in self.seen:
             self.dup_hits[can] += 1
