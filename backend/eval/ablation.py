@@ -12,12 +12,12 @@ from orchestrator import run_lab, summarize  # noqa: E402
 CHECKPOINTS = (50, 100, 250, 500, 1000)
 
 
-def run_pair(seed: int, budget: int, branches: str = "abc", llm=None, noise: float = 1.0, exploit: bool = False):
+def run_pair(seed: int, budget: int, branches: str = "abc", llm=None, noise: float = 1.0, exploit: bool = False, seed_mode: str = "known"):
     out = {}
     for name, adv in (("ours", True), ("ablated", False)):
         sess = asyncio.run(run_lab(budget=budget, branches=branches, llm=llm, seed=seed, verbose=False,
-                                   adversary=adv, noise=noise, exploit=exploit,
-                                   run_id=f"{name}_{branches}_seed{seed}"))
+                                   adversary=adv, noise=noise, exploit=exploit, seed_mode=seed_mode,
+                                   run_id=f"{name}_{branches}_{seed_mode}_seed{seed}"))
         csv = sess.oracle.traj_path
         n_rows = len(pd.read_csv(csv))
         # identical-budget assertions: same ceiling, fully spent, and the CSV agrees with the counter

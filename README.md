@@ -9,8 +9,8 @@ of the oracle's training domain).
 > mock** (`backend/agents/offline.py`: RDKit edits plus a configurable rate of rule-violating proposals), not
 > from Haiku/Sonnet. The mock validates plumbing, policies, logging and evaluation; it is **not evidence about
 > LLM behaviour**. The Anthropic executor and the single-call baseline are written but have not been run live.
-> Also, the seed beam contains known DRD2 drugs the oracle already scores ≈1.0, which flatters every
-> comparison against a cold-start method like Graph GA (see *Acceleration claim*).
+> Also, the default seed beam contains known DRD2 drugs the oracle already scores ≈1.0, which flatters every
+> comparison against a cold-start method like Graph GA; see the cold-start table for the fair view.
 
 ## Layout
 ```
@@ -26,7 +26,7 @@ backend/
   agents/           scout, branch_a/b/c, adversary, coordinator (+ offline mock)
   baselines/        random_stub.py, single_call_llm.py
   eval/             pmo_auc.py, ablation.py, run_seeds.py, render_results.py
-  tests/            27 tests
+  tests/            28 tests
 ```
 Everything runs from the repo root; data lands in `backend/data/` (gitignored except the folder skeleton).
 
@@ -39,40 +39,58 @@ stay <2.4: numpy 2.5 makes TDC's `float(array([x]))` raise, which TDC swallows i
 python3.13 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt && .venv/bin/pip install --no-deps PyTDC==1.1.15
 AUTOPILOT=true .venv/bin/python -m pytest -q
 AUTOPILOT=true .venv/bin/python backend/orchestrator.py --budget 100 --branches ab     # Stage 2 gate run
-AUTOPILOT=true .venv/bin/python backend/eval/run_seeds.py                               # 3 seeds x {ours, ablated}
+AUTOPILOT=true .venv/bin/python backend/eval/run_seeds.py [known|cold]                  # 3 seeds x {ours, ablated}
 ```
 Set `ANTHROPIC_API_KEY` (or `LLM_MODE=anthropic`) to use real Haiku/Sonnet; without it the mock is used.
 `AUTOPILOT=true` logs approval-gate events and auto-rejects; leave it unset for the interactive `input()` demo.
 
 ## Results (offline mock; budget 1,000; seeds 0–2; mean and variance across seeds)
-Metric: PMO top-10 AUC, trapezoid over top-10 mean sampled every 10 calls, normalised by the budget at each column.
+Metric: PMO top-10 AUC (trapezoid over the top-10 mean sampled every 10 calls, normalised by the budget at each
+column). Two seed modes, both with the 5 seed molecules counted against the budget.
 
-| method | @50 | @100 | @250 | @500 | @10,000 |
-|---|---|---|---|---|---|
-| ours (adversary on) | 0.853 (var 3.9e-04) | 0.924 (var 1.0e-04) | 0.968 (var 1.6e-05) | 0.984 (var 3.5e-06) | N/A — budget-capped by design |
-| ours-ablated (adversary off) | 0.853 (var 3.9e-04) | 0.924 (var 1.0e-04) | 0.968 (var 1.6e-05) | 0.984 (var 3.5e-06) | N/A — budget-capped by design |
-| single-call LLM | not run (no API key) | not run (no API key) | not run (no API key) | not run (no API key) | N/A (50 molecules total) |
-| random (ZINC) | 0.026 (var 3.6e-04) | 0.037 (var 6.5e-04) | 0.064 (var 1.5e-03) | 0.113 (var 6.2e-04) | 0.534 (var 4.7e-03) |
-| Graph GA (published, PMO) | not published | not published | not published | not published | 0.964 ± 0.012 |
+**A. Warm start — the spec's 5 known DRD2 ligands** (`--seed-mode known`; oracle already ≈1.0 on 3 of them)
 
-**Ablation is a null result, and by construction.** With and without the adversary, the runs are identical
-because the trigger (`unique_scaffolds_top10 < 3 OR sa_trend_3r > 1.2 OR ad_similarity_trend < -0.15`) fired in
-**0 of 3 seeds** — the mock never reward-hacks, and a synthetic "exploiter" mode (bolting amine stacks onto
-molecules) did not reach the top-10 either, so no exploit signature appeared. I did not tune thresholds to make
-it fire. The harness asserts identical budgets (`ceiling == oracle.calls == CSV rows` for both arms). The
-adversary → coordinator → prompt-injection path is covered by a plumbing test with an *injected* trigger
-(`tests/test_stage3.py`), not by evidence that it catches real exploits. Showing that needs a live-LLM run.
+| method | @50 | @100 | @250 | @500 | @1,000 | @10,000 |
+|---|---|---|---|---|---|---|
+| ours (adversary on) | 0.853 (var 3.9e-04) | 0.924 (var 1.0e-04) | 0.968 (var 1.6e-05) | 0.984 (var 3.6e-06) | 0.992 (var 8.9e-07) | N/A — budget-capped by design |
+| ours-ablated (adversary off) | 0.853 (var 3.9e-04) | 0.924 (var 1.0e-04) | 0.968 (var 1.6e-05) | 0.984 (var 3.6e-06) | 0.992 (var 8.9e-07) | N/A — budget-capped by design |
+| single-call LLM | not run (no API key) | not run (no API key) | not run (no API key) | not run (no API key) | not run (no API key) | N/A (50 molecules total) |
+| random (ZINC) | 0.026 (var 3.6e-04) | 0.037 (var 6.5e-04) | 0.064 (var 1.5e-03) | 0.113 (var 6.2e-04) | 0.182 (var 1.1e-03) | 0.534 (var 4.7e-03) |
+| Graph GA (published, PMO) | not published | not published | not published | not published | not published | 0.964 ± 0.012 |
 
-### Acceleration claim (derived only from the curves)
-- Our running top-10 mean passes Graph GA's published 0.964 after **15–19 oracle calls** (3 seeds), and our
-  AUC computed over N calls first exceeds 0.964 between **N = 200 (0.961) and N = 250 (0.968)**.
-- **This is not a defensible speed-up claim.** Seeding with haloperidol/aripiprazole/risperidone (oracle ≈ 1.0)
-  means one fluorine on haloperidol already scores ≈1.0; Graph GA's 0.964 is a cold-start 10,000-call AUC, and
-  AUC at different budgets is not like-for-like. I am not stating a yield ratio. A fair test needs cold-start
-  seeds (or weak seeds only) and the real LLM branches.
+**B. Cold start — 5 random ZINC molecules** (`--seed-mode cold`; the fair comparison with Graph GA / random)
+
+| method | @50 | @100 | @250 | @500 | @1,000 | @10,000 |
+|---|---|---|---|---|---|---|
+| ours (adversary on) | 0.019 (var 4.3e-05) | 0.039 (var 3.3e-04) | 0.075 (var 1.9e-03) | 0.119 (var 5.7e-03) | 0.223 (var 2.0e-02) | N/A — budget-capped by design |
+| ours-ablated (adversary off) | 0.019 (var 4.3e-05) | 0.039 (var 3.3e-04) | 0.075 (var 1.9e-03) | 0.119 (var 5.7e-03) | 0.223 (var 2.0e-02) | N/A — budget-capped by design |
+| single-call LLM | not run (no API key) | not run (no API key) | not run (no API key) | not run (no API key) | not run (no API key) | N/A (50 molecules total) |
+| random (ZINC) | 0.026 (var 3.6e-04) | 0.037 (var 6.5e-04) | 0.064 (var 1.5e-03) | 0.113 (var 6.2e-04) | 0.182 (var 1.1e-03) | 0.534 (var 4.7e-03) |
+| Graph GA (published, PMO) | not published | not published | not published | not published | not published | 0.964 ± 0.012 |
+
+**How to read these.**
+- **Warm start (A) is not evidence of a speed-up.** One fluorine on haloperidol already scores ≈1.0, so the
+  running top-10 mean passes Graph GA's published 0.964 after only **15–19 calls**, and our AUC over N calls first
+  exceeds 0.964 between N = 200 (0.961) and N = 250 (0.968). Graph GA's 0.964 is a cold-start 10,000-call AUC and
+  AUC at different budgets is not like-for-like, so I am not stating a yield ratio.
+- **Cold start (B) shows the mock is not an optimiser.** AUC@1,000 = 0.223 (var 2.0e-02, large) vs random 0.182;
+  that is roughly random-level and nowhere near 0.964. The mock proposes edits without knowing what raises DRD2,
+  so this says nothing for or against LLM branches — it only shows the warm-start numbers came from the seeds.
+  **The "match Graph GA in ~10× fewer oracle calls" claim is therefore currently unsupported.** Testing it needs
+  the real Haiku/Sonnet branches under cold start.
 - **Crossover where the advantage reverses: not determinable.** PMO publishes only Graph GA's 10,000-call
-  endpoint, not its AUC@50/100/250/500, so there is no published curve to cross. Our budget cap means our curve
-  also stops at 1,000.
+  endpoint, not its AUC@50/100/250/500/1,000, so there is no published curve to cross; our curve also stops at
+  1,000 by design.
+
+**Ablation is a null result, and by construction.** With and without the adversary the runs are identical in
+both modes, because the trigger (`unique_scaffolds_top10 < 3 OR sa_trend_3r > 1.2 OR ad_similarity_trend <
+-0.15`) fired in **0 of 3 seeds** per mode — the mock never reward-hacks, and a synthetic "exploiter" mode did not
+reach the top-10 either. I did not tune thresholds to make it fire. The harness asserts identical budgets
+(`ceiling == oracle.calls == CSV rows` for both arms) — an assertion that caught a real dead-end: a cold-start
+run filled the beam with ~600 Da molecules and stalled at 500 calls (every add-on edit failed the MW cap). Fixed
+by giving agents each parent's MW and teaching the mock to trim; runs now flag `stalled` in their summary instead
+of truncating silently. The adversary → coordinator → prompt-injection path is covered by a plumbing test with an
+*injected* trigger (`tests/test_stage3.py`), not by evidence that it catches real exploits.
 
 ## Disclosures
 1. **Versions and reference table.** PyTDC **1.1.15** (rdkit 2026.3.6, scikit-learn 1.9.1, numpy 2.3.5). The

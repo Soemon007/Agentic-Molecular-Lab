@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 
 from omnigent.inner.datamodel import SessionState
 
+from rdkit.Chem import Descriptors
+
 import chem_core
 from chem_core import Candidate, Gatekeeper, ScaffoldBeam, SEEDS
 from agents import REGISTRY
@@ -45,6 +47,7 @@ class LabSession:
     last_rejections: dict = field(default_factory=dict)
     chatlog: object = None
     adversary_enabled: bool = True
+    stalled: bool = False
     coordinator: object = None
     trigger_log: list = field(default_factory=list)
     adversary_calls: int = 0
@@ -54,10 +57,29 @@ class LabSession:
         return self.oracle.calls
 
 
-def seed_beam(oracle, beam: ScaffoldBeam | None = None, gatekeeper: Gatekeeper | None = None) -> ScaffoldBeam:
-    """Generation 0: 5 known DRD2 ligands of mixed strength, scored via the oracle (they count)."""
+def cold_seeds(n: int = 5, seed: int = 0) -> list[str]:
+    """Random ZINC molecules (valid, pass the general Gatekeeper limits): a cold start comparable to PMO methods."""
+    from tdc.generation import MolGen
+    import compat  # noqa: F401
+    from domain import DATA
+    pool = MolGen(name="ZINC", path=str(DATA)).get_data()["smiles"].tolist()
+    gk, out, rng = Gatekeeper(), [], random.Random(1000 + seed)
+    while len(out) < n:
+        smi = rng.choice(pool)
+        mol, _ = gk.check(smi, "seed")
+        if mol is not None:
+            out.append(smi)
+    return out
+
+
+def seed_beam(oracle, beam: ScaffoldBeam | None = None, gatekeeper: Gatekeeper | None = None,
+              mode: str = "known", seed: int = 0) -> ScaffoldBeam:
+    """Generation 0, 5 molecules scored via the oracle (they count against the budget).
+    known = the spec's 5 DRD2 ligands of mixed strength (warm start; oracle already ~1.0 on 3 of them)
+    cold  = 5 random ZINC molecules (fair comparison with cold-start methods such as Graph GA)"""
     beam = ScaffoldBeam() if beam is None else beam
-    for name, smi in SEEDS.items():
+    smiles = list(SEEDS.values()) if mode == "known" else cold_seeds(5, seed)
+    for smi in smiles:
         if gatekeeper is not None:
             gatekeeper.register_seen(smi)
         c = Candidate(smiles=smi, origin_branch="seed", generation=0)
@@ -67,7 +89,8 @@ def seed_beam(oracle, beam: ScaffoldBeam | None = None, gatekeeper: Gatekeeper |
 
 
 def beam_payload(beam, n, extra=None, limit=20):
-    rows = [{"id": c.id, "smiles": c.smiles, "score": round(c.score, 3), "scaffold": c.core_scaffold}
+    rows = [{"id": c.id, "smiles": c.smiles, "score": round(c.score, 3), "scaffold": c.core_scaffold,
+             "mw": round(Descriptors.MolWt(chem_core.mol_from_smiles(c.smiles)), 1)}  # lets agents respect the MW cap
             for c in sorted(beam.members, key=lambda c: -c.score)[:limit]]
     return {"beam": rows, "n": n, **(extra or {})}
 
@@ -169,10 +192,10 @@ async def adversary_step(sess, gate, executor, rnd):
 
 
 async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_path=None, verbose=True,
-                  noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None):
+                  noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None, seed_mode="known"):
     from oracle import DRD2Oracle
     random.seed(seed)
-    run_id = run_id or f"{'adv' if adversary else 'noadv'}_{branches}_seed{seed}"
+    run_id = run_id or f"{'adv' if adversary else 'noadv'}_{branches}_{seed_mode}_seed{seed}"
     oracle = DRD2Oracle(traj_path=traj_path or str(DATA / "trajectories" / f"ours_{run_id}.csv"),
                         report_at_exit=False)
     sess = LabSession(oracle=oracle, budget=budget)
@@ -183,7 +206,7 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
     executor = make_executor(llm or llm_mode(), seed)
     if hasattr(executor, "noise"):
         executor.noise, executor.exploit = noise, exploit
-    seed_beam(oracle, sess.beam, sess.gatekeeper)
+    seed_beam(oracle, sess.beam, sess.gatekeeper, seed_mode, seed)
     sess.history.append({**telemetry.snapshot(sess.beam), "round": 0})  # history[r] == round r
     sess.state = SessionState.RUNNING
     sess.coordinator = Coordinator([BRANCHES[b] for b in branches], default=quota)
@@ -202,6 +225,7 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
                   + (f" TRIGGER={trig['fired']} -> {trig['flagged']}" if trig["fired"] else ""))
         stalled = stalled + 1 if oracle.calls == before else 0
         if stalled >= 5:  # gatekeeper/policies rejecting everything: stop rather than spin
+            sess.stalled = True  # surfaced in the summary; never a silent truncation
             break
     sess.state = SessionState.COMPLETED
     oracle.report()
@@ -214,7 +238,7 @@ def summarize(sess: LabSession) -> dict:
            "rejections": sess.gatekeeper.rejection_report(), "accepted": dict(sess.gatekeeper.accepted),
            "policy_counts": sess.gate.counts, "tokens": sess.ledger.as_dict(),
            "trigger_rounds": sum(1 for t in sess.trigger_log if t["fired"]),
-           "adversary_calls": sess.adversary_calls, "rounds": len(sess.history) - 1}
+           "adversary_calls": sess.adversary_calls, "stalled": sess.stalled, "rounds": len(sess.history) - 1}
     by_branch = {}
     for c in sess.all_candidates:
         by_branch.setdefault(c.origin_branch, set()).add(c.core_scaffold)
@@ -234,9 +258,10 @@ if __name__ == "__main__":
     ap.add_argument("--llm", choices=["offline", "anthropic"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--noise", type=float, default=1.0, help="offline mock: rate of rule-violating proposals")
+    ap.add_argument("--seed-mode", choices=["known", "cold"], default="known")
     ap.add_argument("--no-adversary", action="store_true")
     ap.add_argument("--exploit", action="store_true", help="offline mock: Explorer reward-hacks (demo only)")
     a = ap.parse_args()
     s = asyncio.run(run_lab(a.budget, a.branches, a.quota, a.llm, a.seed, noise=a.noise,
-                         adversary=not a.no_adversary, exploit=a.exploit))
+                         adversary=not a.no_adversary, exploit=a.exploit, seed_mode=a.seed_mode))
     print(json.dumps(summarize(s), indent=2))

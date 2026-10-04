@@ -120,3 +120,12 @@ def test_domain_reference_size_and_direction():
     hal = domain.ad_similarity(Chem.MolFromSmiles(chem_core.SEEDS["haloperidol"]))
     junk = domain.ad_similarity(Chem.MolFromSmiles("C" * 10))
     assert hal > junk  # HIGH = in-domain
+
+
+def test_cold_seeds_are_counted_valid_and_not_the_known_drugs(tmp_path):
+    from oracle import DRD2Oracle
+    o = DRD2Oracle(traj_path=tmp_path / "t.csv", fail_log=tmp_path / "f.log", report_at_exit=False)
+    beam = seed_beam(o, mode="cold", seed=0)
+    assert o.calls == 5 and len(beam) >= 1 and o.failures == 0
+    assert not set(c.smiles for c in beam) & set(chem_core.SEEDS.values())
+    o._fh.close()

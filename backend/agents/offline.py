@@ -50,6 +50,20 @@ def _ring_swap(mol, rng, aromatic=True):
         return None
 
 
+def _trim(mol, rng):
+    """Remove a terminal, non-ring heavy atom (keeps ring system/scaffold): what an LLM does when told it is over the MW cap."""
+    ends = [a.GetIdx() for a in mol.GetAtoms() if a.GetDegree() == 1 and not a.IsInRing()]
+    if not ends:
+        return None
+    em = Chem.RWMol(mol)
+    em.RemoveAtom(rng.choice(ends))
+    try:
+        m = em.GetMol(); Chem.SanitizeMol(m)
+        return Chem.MolToSmiles(m)
+    except Exception:
+        return None
+
+
 def _a(mol, rng, noise):
     r = rng.random()
     sites = _h_sites(mol)
@@ -114,7 +128,10 @@ def respond(agent: str, payload: dict, seed: int, noise: float = 1.0, exploit: b
         tries += 1
         parent = rng.choice(beam)
         mol = Chem.MolFromSmiles(parent["smiles"])
-        smi = fn(mol, rng, noise) if mol else None
+        if mol and parent.get("mw", 0) > 520 and agent in ("branch_a", "branch_c") and rng.random() < 0.8:
+            smi = _trim(mol, rng)  # heavy parent: shrink instead of grow
+        else:
+            smi = fn(mol, rng, noise) if mol else None
         if smi:
             out.append({"parent_id": parent["id"], "smiles": smi})
     return {"proposals": out}

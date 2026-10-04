@@ -23,10 +23,10 @@ def agg(runs, cond):
                      "values": [r[cond]["auc"][c] for r in runs]} for c in cps}
 
 
-def main(budget=1000, seeds=(0, 1, 2), branches="abc", llm=None, exploit=False, tag="main"):
-    runs = [run_pair(s, budget, branches, llm=llm, exploit=exploit) for s in seeds]
+def main(budget=1000, seeds=(0, 1, 2), branches="abc", llm=None, exploit=False, tag="main", seed_mode="known"):
+    runs = [run_pair(s, budget, branches, llm=llm, exploit=exploit, seed_mode=seed_mode) for s in seeds]
     res = {"budget": budget, "seeds": list(seeds), "llm_mode": runs[0]["ours"]["summary"]["llm_mode"],
-           "exploit_mock": exploit, "ours": agg(runs, "ours"), "ablated": agg(runs, "ablated"),
+           "exploit_mock": exploit, "seed_mode": seed_mode, "ours": agg(runs, "ours"), "ablated": agg(runs, "ablated"),
            "trigger_rounds": [r["ours"]["summary"]["trigger_rounds"] for r in runs],
            "adversary_calls": [r["ours"]["summary"]["adversary_calls"] for r in runs],
            "tokens": [r["ours"]["summary"]["tokens"]["total"] for r in runs],
@@ -42,4 +42,5 @@ def main(budget=1000, seeds=(0, 1, 2), branches="abc", llm=None, exploit=False, 
 
 
 if __name__ == "__main__":
-    print(json.dumps(main(), indent=1))
+    mode = sys.argv[1] if len(sys.argv) > 1 else "known"
+    print(json.dumps(main(seed_mode=mode, tag="main" if mode == "known" else mode), indent=1))
