@@ -21,8 +21,12 @@ from omnigent.inner.datamodel import SessionState
 import chem_core
 from chem_core import Candidate, Gatekeeper, ScaffoldBeam, SEEDS
 from agents import REGISTRY
+from agents.coordinator import Coordinator
+import telemetry
 from agents.base import run_agent
 from llm import TokenLedger, llm_mode, make_executor
+from chatlog import ChatLog
+from domain import DATA
 from policies import build_gate
 
 BRANCHES = {"a": "branch_a", "b": "branch_b", "c": "branch_c"}
@@ -39,6 +43,11 @@ class LabSession:
     ledger: TokenLedger = field(default_factory=TokenLedger)
     all_candidates: list = field(default_factory=list)
     last_rejections: dict = field(default_factory=dict)
+    chatlog: object = None
+    adversary_enabled: bool = True
+    coordinator: object = None
+    trigger_log: list = field(default_factory=list)
+    adversary_calls: int = 0
 
     @property
     def oracle_calls_used(self) -> int:
@@ -75,17 +84,24 @@ async def oracle_step(sess: LabSession, gate, cand: Candidate) -> bool:
     return True
 
 
+def _log_outcome(sess, out, **kw):
+    if sess.chatlog:
+        sess.chatlog.proposal_outcome(**out, gate_reason=kw.pop("gate_reason", None),
+                                      oracle_score=kw.pop("oracle_score", None), **kw)
+
+
 async def run_round(sess: LabSession, gate, executor, rnd: int, quotas: dict[str, int], instructions=None,
                     oversample: int = 3) -> dict:
     instructions = instructions or {}
-    brief = await run_agent(REGISTRY["scout"], executor, beam_payload(sess.beam, 1), gate, sess.ledger)
+    brief = await run_agent(REGISTRY["scout"], executor, beam_payload(sess.beam, 1), gate, sess.ledger,
+                            chatlog=sess.chatlog, rnd=rnd)
     brief_text = brief.args.get("brief", "")
 
     async def branch(name, quota):
         extra = {"brief": brief_text, "feedback_last_round": sess.last_rejections.get(name, {}),
                  "instruction": instructions.get(name, "")}
         r = await run_agent(REGISTRY[name], executor, beam_payload(sess.beam, quota * oversample, extra),
-                            gate, sess.ledger)
+                            gate, sess.ledger, chatlog=sess.chatlog, rnd=rnd)
         return name, r
 
     results = await asyncio.gather(*(branch(n, q) for n, q in quotas.items() if q > 0))
@@ -100,11 +116,15 @@ async def run_round(sess: LabSession, gate, executor, rnd: int, quotas: dict[str
             if taken >= quotas[name] or sess.oracle.calls >= sess.budget:
                 break
             parent = by_id.get(p.get("parent_id"))
+            out = {"call_id": r.call_id, "round": rnd, "agent": name, "parent_id": p.get("parent_id"),
+                   "smiles": p.get("smiles"), "agent_generated": True}
             if parent is None:
                 sess.gatekeeper._reject(name, "unknown_parent")
+                _log_outcome(sess, out, gate_reason="unknown_parent")
                 continue
             mol, reason = sess.gatekeeper.check(p.get("smiles", ""), name, parent.smiles)
             if mol is None:
+                _log_outcome(sess, out, gate_reason=reason)
                 continue
             cand = Candidate(smiles=chem_core.Chem.MolToSmiles(mol), origin_branch=name, parent_id=parent.id,
                              generation=rnd)
@@ -113,39 +133,73 @@ async def run_round(sess: LabSession, gate, executor, rnd: int, quotas: dict[str
                 sess.all_candidates.append(cand)
                 scored.append(cand)
                 taken += 1
+                _log_outcome(sess, out, oracle_score=round(cand.score, 4), ad_similarity=cand.ad_similarity,
+                             sa_score=cand.sa_score, alerts=cand.alerts, scaffold=cand.core_scaffold)
+            else:
+                _log_outcome(sess, out, gate_reason="policy_rejected")
         after = sess.gatekeeper.rejections.get(name, {})
         sess.last_rejections[name] = {k: v - before.get(k, 0) for k, v in after.items() if v - before.get(k, 0)}
     top = sess.beam.top(10)
-    rec = {"round": rnd, "oracle_calls_used": sess.oracle_calls_used, "scored": len(scored),
+    rec = {**telemetry.snapshot(sess.beam), "round": rnd, "oracle_calls_used": sess.oracle_calls_used, "scored": len(scored),
            "top10_mean": round(sum(c.score for c in top) / len(top), 4), "best": round(top[0].score, 4),
            "scaffolds_in_beam": len(sess.beam.scaffold_counts())}
     sess.history.append(rec)
     return rec
 
 
+async def adversary_step(sess, gate, executor, rnd):
+    """Deterministic trigger (free). Sonnet adversary + coordinator only when it fires."""
+    digest = telemetry.build_digest(sess.beam, sess.history, rnd, sess.oracle_calls_used)
+    fired = telemetry.trigger(digest)
+    blame = telemetry.flagged_branch(sess.beam) if fired else None
+    rec = {"round": rnd, "fired": fired, "flagged": blame, "acted": False, "stats": digest["stats"]}
+    if fired and blame and sess.coordinator.in_cooldown(blame):
+        rec["skipped"] = "cooldown"
+    elif fired and blame and sess.adversary_enabled:
+        r = await run_agent(REGISTRY["adversary"], executor, digest, gate, sess.ledger, temperature=0.0,
+                            chatlog=sess.chatlog, rnd=rnd)
+        sess.adversary_calls += 1
+        if r.args:
+            rec["diagnosis"], rec["instruction"] = r.args.get("diagnosis"), r.args.get("instruction")
+            rec["acted"] = sess.coordinator.flag(blame, r.args.get("instruction", ""))
+    sess.trigger_log.append(rec)
+    if sess.chatlog and fired:
+        sess.chatlog.event("adversary_trigger", **{k: v for k, v in rec.items() if k != "stats"}, stats=rec["stats"])
+    return rec
+
+
 async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_path=None, verbose=True,
-                  noise=1.0, max_rounds=1000):
+                  noise=1.0, max_rounds=1000, adversary=True, exploit=False, run_id=None):
     from oracle import DRD2Oracle
     random.seed(seed)
-    oracle = DRD2Oracle(traj_path=traj_path or f"data/trajectories/ours_{branches}_seed{seed}.csv",
+    run_id = run_id or f"{'adv' if adversary else 'noadv'}_{branches}_seed{seed}"
+    oracle = DRD2Oracle(traj_path=traj_path or str(DATA / "trajectories" / f"ours_{run_id}.csv"),
                         report_at_exit=False)
     sess = LabSession(oracle=oracle, budget=budget)
+    sess.adversary_enabled = adversary
+    sess.chatlog = ChatLog(run_id)
     gate = build_gate(oracle, budget)
     sess.gate = gate
     executor = make_executor(llm or llm_mode(), seed)
     if hasattr(executor, "noise"):
-        executor.noise = noise
+        executor.noise, executor.exploit = noise, exploit
     seed_beam(oracle, sess.beam, sess.gatekeeper)
+    sess.history.append({**telemetry.snapshot(sess.beam), "round": 0})  # history[r] == round r
     sess.state = SessionState.RUNNING
-    quotas = {BRANCHES[b]: quota for b in branches}
+    sess.coordinator = Coordinator([BRANCHES[b] for b in branches], default=quota)
     rnd, stalled = 0, 0
     while oracle.calls < budget and rnd < max_rounds:  # hard stop at the ceiling
         rnd += 1
         before = oracle.calls
-        rec = await run_round(sess, gate, executor, rnd, quotas)
+        quotas, instr = sess.coordinator.quotas(), sess.coordinator.instructions()
+        rec = await run_round(sess, gate, executor, rnd, quotas, instr)
+        sess.coordinator.end_round()  # decrement cooldowns BEFORE a fresh flag
+        trig = await adversary_step(sess, gate, executor, rnd)
+        rec["quotas"], rec["trigger"] = quotas, trig["fired"]
         if verbose:
             print(f"round {rnd:3d} calls={rec['oracle_calls_used']:4d} top10={rec['top10_mean']:.3f} "
-                  f"best={rec['best']:.3f} scaffolds={rec['scaffolds_in_beam']}")
+                  f"best={rec['best']:.3f} scaffolds={rec['scaffolds_in_beam']} quotas={list(quotas.values())}"
+                  + (f" TRIGGER={trig['fired']} -> {trig['flagged']}" if trig["fired"] else ""))
         stalled = stalled + 1 if oracle.calls == before else 0
         if stalled >= 5:  # gatekeeper/policies rejecting everything: stop rather than spin
             break
@@ -158,7 +212,9 @@ async def run_lab(budget=100, branches="ab", quota=4, llm=None, seed=0, traj_pat
 def summarize(sess: LabSession) -> dict:
     out = {"llm_mode": llm_mode(), "oracle_calls": sess.oracle.calls, "failures": sess.oracle.failures,
            "rejections": sess.gatekeeper.rejection_report(), "accepted": dict(sess.gatekeeper.accepted),
-           "policy_counts": sess.gate.counts, "tokens": sess.ledger.as_dict()}
+           "policy_counts": sess.gate.counts, "tokens": sess.ledger.as_dict(),
+           "trigger_rounds": sum(1 for t in sess.trigger_log if t["fired"]),
+           "adversary_calls": sess.adversary_calls, "rounds": len(sess.history) - 1}
     by_branch = {}
     for c in sess.all_candidates:
         by_branch.setdefault(c.origin_branch, set()).add(c.core_scaffold)
@@ -178,6 +234,9 @@ if __name__ == "__main__":
     ap.add_argument("--llm", choices=["offline", "anthropic"])
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--noise", type=float, default=1.0, help="offline mock: rate of rule-violating proposals")
+    ap.add_argument("--no-adversary", action="store_true")
+    ap.add_argument("--exploit", action="store_true", help="offline mock: Explorer reward-hacks (demo only)")
     a = ap.parse_args()
-    s = asyncio.run(run_lab(a.budget, a.branches, a.quota, a.llm, a.seed, noise=a.noise))
+    s = asyncio.run(run_lab(a.budget, a.branches, a.quota, a.llm, a.seed, noise=a.noise,
+                         adversary=not a.no_adversary, exploit=a.exploit))
     print(json.dumps(summarize(s), indent=2))

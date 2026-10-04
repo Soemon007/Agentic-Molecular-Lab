@@ -4,7 +4,7 @@ These run in code on every tool call, regardless of what any prompt says:
   1. write_permission     — only the oracle wrapper writes scores; agents get only their own tool
   2. budget_cap           — hard stop at the oracle-call ceiling
   3. electrophile_approval — electrophile alert pauses for human approval (AUTOPILOT=true: log + auto-reject)
-Policy events are appended to data/policy_events.jsonl.
+Policy events are appended to backend/data/policy_events.jsonl.
 """
 from __future__ import annotations
 
@@ -74,9 +74,9 @@ class Verdict:
 class PolicyGate:
     """Evaluates policies in declaration order: DENY short-circuits, ASK goes to the approver."""
 
-    def __init__(self, policies: list[FunctionPolicy], log_path="data/policy_events.jsonl", autopilot=None):
+    def __init__(self, policies: list[FunctionPolicy], log_path=None, autopilot=None):
         self.policies = policies
-        self.log_path = Path(log_path)
+        self.log_path = Path(log_path) if log_path else Path(__file__).resolve().parent / "data" / "policy_events.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.autopilot = AUTOPILOT if autopilot is None else autopilot
         self.counts = {"ALLOW": 0, "DENY": 0, "ASK": 0, "ASK_APPROVED": 0, "ASK_REJECTED": 0}
@@ -113,7 +113,7 @@ class PolicyGate:
         return input(f"\n[APPROVAL] {reason}\n  molecule: {smi}\n  send to oracle? [y/N] ").strip().lower() == "y"
 
 
-def build_gate(oracle, ceiling: int, log_path="data/policy_events.jsonl", autopilot=None) -> PolicyGate:
+def build_gate(oracle, ceiling: int, log_path=None, autopilot=None) -> PolicyGate:
     return PolicyGate([
         FunctionPolicy(name="write_permission", on=["tool_call"], callable=write_permission),
         FunctionPolicy(name="budget_cap", on=["tool_call"], callable=make_budget_cap(oracle, ceiling)),

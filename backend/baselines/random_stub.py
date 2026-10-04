@@ -5,14 +5,15 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
 from oracle import DRD2Oracle  # noqa: E402  (also applies the tdc compat shim)
 
 
 def main(n=10_000, seed=0, out=None):
     from tdc.generation import MolGen
-    smiles = MolGen(name="ZINC", path=str(Path(__file__).resolve().parents[1] / "data")).get_data()["smiles"].tolist()
+    smiles = MolGen(name="ZINC", path=str(ROOT / "data")).get_data()["smiles"].tolist()
     picks = random.Random(seed).sample(smiles, n)
-    oracle = DRD2Oracle(traj_path=out or f"data/trajectories/random_seed{seed}.csv")
+    oracle = DRD2Oracle(traj_path=out or str(ROOT / "data" / "trajectories" / f"random_seed{seed}.csv"))
     for s in picks:
         oracle(s, "random")
     oracle.close()

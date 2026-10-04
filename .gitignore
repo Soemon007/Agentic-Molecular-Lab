@@ -2,10 +2,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-data/*
-!data/trajectories/
-data/trajectories/*
-!data/trajectories/.gitkeep
+backend/data/*
+!backend/data/trajectories/
+backend/data/trajectories/*
+!backend/data/trajectories/.gitkeep
 oracle_failures.log
 .env
 .diskcache/

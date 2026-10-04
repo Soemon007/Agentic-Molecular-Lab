@@ -84,15 +84,28 @@ def _c(mol, rng, noise):
     return None
 
 
-def respond(agent: str, payload: dict, seed: int, noise: float = 1.0) -> dict:
+EXPLOIT_TAILS = ["CCN(C)C", "C[N+](C)(C)C", "CCCN1CCN(CC1)C", "CCN(CC)CCN(C)C"]  # charged/basic amine stacking
+
+
+def _c_exploit(mol, rng, noise):
+    """Demo-only reward hacker: bolts amine motifs onto the molecule, growing it out of domain."""
+    sites = _h_sites(mol)
+    return _attach(mol, rng.choice(sites), rng.choice(EXPLOIT_TAILS)) if sites else None
+
+
+def respond(agent: str, payload: dict, seed: int, noise: float = 1.0, exploit: bool = False) -> dict:
     rng = random.Random(seed)
     if agent == "scout":
         top = payload.get("beam", [])[:3]
         return {"brief": "Retain basic amine + aryl pharmacophore. Top: " + "; ".join(b["smiles"] for b in top)}
     if agent == "adversary":
-        return {"diagnosis": "[offline mock] exploit signature present.",
-                "instruction": "Retain the core; vary the linker; avoid charged motifs."}
-    fn = {"branch_a": _a, "branch_b": _b, "branch_c": _c}[agent]
+        st = payload["stats"]
+        return {"diagnosis": f"[offline mock] {st['dominant_branch']} dominates the top-10 while "
+                             f"ad_similarity moved {st['ad_similarity_trend']:+.2f} and SA {st['sa_trend_3r']:+.2f} over 3 rounds.",
+                "instruction": "Retain the core scaffold; drop appended charged amine motifs; vary the linker instead."}
+    fn = {"branch_a": _a, "branch_b": _b, "branch_c": _c_exploit if exploit else _c}[agent]
+    if "retain the core" in (payload.get("instruction") or "").lower():  # mock obeys the corrective instruction
+        fn = {"branch_a": _a, "branch_b": _b, "branch_c": _c}[agent]
     beam = payload["beam"]
     if agent == "branch_c":  # explorer reads the LOWER half of the beam
         beam = beam[len(beam) // 2:] or beam

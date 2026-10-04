@@ -25,7 +25,8 @@ def parse_smiles(text: str) -> list[str]:
     return out
 
 
-def run(client=None, out="data/trajectories/single_call_llm.csv", model=HAIKU):
+def run(client=None, out=None, model=HAIKU):
+    out = out or str(Path(__file__).resolve().parents[1] / "data" / "trajectories" / "single_call_llm.csv")
     if client is None:
         import anthropic
         client = anthropic.Anthropic()

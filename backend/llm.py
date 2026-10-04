@@ -85,6 +85,7 @@ class OfflineExecutor(Executor):
 
     def __init__(self, seed: int = 0, noise: float = 1.0):
         self.seed = seed
+        self.exploit = False
         self.noise = noise  # scales the rate of deliberate rule-violating proposals
         self._turn = 0
 
@@ -95,7 +96,7 @@ class OfflineExecutor(Executor):
         payload = json.loads(next(m.content for m in reversed(messages) if m.role == "user"))
         self._turn += 1
         args = offline.respond(agent, payload, seed=zlib.crc32(f"{self.seed}|{agent}|{self._turn}".encode()),
-                               noise=self.noise)
+                               noise=self.noise, exploit=self.exploit)
         yield ToolCallRequest(name=tools[0]["name"], args=args, metadata={"usage": {}})
 
 
